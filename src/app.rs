@@ -8,7 +8,7 @@ use rayon::ThreadPool;
 use rayon::prelude::*;
 
 use crate::cache::{
-    apply_feedback_from_file, cache_fingerprint, load_cache, prune_cache, save_cache,
+    apply_feedback_from_file, cache_fingerprint, load_cache, memo_key, prune_cache, save_cache,
 };
 use crate::classify::{
     build_rule_priority_indexes, classify_from_cache_with_indexes, classify_with_codex_result,
@@ -20,8 +20,8 @@ use crate::gog::{
     GmailWriteOptions, apply_labels_with_options, archive_threads_with_options, ensure_label,
     fetch_existing_labels, fetch_pending,
 };
-use crate::models::{Args, CacheData, CodexClassify, ThreadInfo};
-use crate::utils::{auto_codex_workers, log, resolve_label_alias};
+use crate::models::{Args, CacheData, CodexClassify, ProcessedThread, ThreadInfo};
+use crate::utils::{auto_codex_workers, log, now_ts, resolve_label_alias};
 
 type DynErr = AppError;
 
@@ -172,11 +172,9 @@ impl AppDeps for RealDeps {
 }
 
 #[allow(clippy::type_complexity)]
-fn collect_threads<D: AppDeps>(
-    deps: &D,
+fn collect_threads(
     args: &Args,
     cache: &mut CacheData,
-    existing_labels: &mut HashSet<String>,
     threads: &[ThreadInfo],
 ) -> std::result::Result<
     (
@@ -206,7 +204,6 @@ fn collect_threads<D: AppDeps>(
             &rule_indexes,
         ) {
             metrics.cache_hits += 1;
-            deps.ensure_label(&label, existing_labels, &args.account, args.dry_run)?;
             grouped.entry(label.clone()).or_default().push(t.id.clone());
             processed_ids.push(t.id.clone());
             log(&format!(
@@ -225,9 +222,8 @@ fn collect_threads<D: AppDeps>(
 #[allow(clippy::too_many_arguments)]
 fn run_codex_for_jobs<D: AppDeps>(
     deps: &D,
-    args: &Args,
     cache: &mut CacheData,
-    existing_labels: &mut HashSet<String>,
+    codex_cmd: &str,
     effective_workers: usize,
     codex_pool: &mut Option<ThreadPool>,
     codex_jobs: Vec<ThreadInfo>,
@@ -244,13 +240,12 @@ fn run_codex_for_jobs<D: AppDeps>(
         effective_workers
     ));
 
-    let codex_cmd = args.codex_cmd.clone();
     let results = if effective_workers <= 1 {
         codex_jobs
             .into_iter()
             .map(|job| {
                 let res =
-                    deps.codex_analyze_email(&job.sender, &job.subject, &job.snippet, &codex_cmd);
+                    deps.codex_analyze_email(&job.sender, &job.subject, &job.snippet, codex_cmd);
                 (job, res)
             })
             .collect::<Vec<_>>()
@@ -268,14 +263,14 @@ fn run_codex_for_jobs<D: AppDeps>(
             codex_jobs
                 .into_par_iter()
                 .map(|job| {
-                    let res = deps.codex_analyze_email(
-                        &job.sender,
-                        &job.subject,
-                        &job.snippet,
-                        &codex_cmd,
-                    );
-                    (job, res)
-                })
+                        let res = deps.codex_analyze_email(
+                            &job.sender,
+                            &job.subject,
+                            &job.snippet,
+                            codex_cmd,
+                        );
+                        (job, res)
+                    })
                 .collect::<Vec<_>>()
         })
     };
@@ -301,7 +296,6 @@ fn run_codex_for_jobs<D: AppDeps>(
             continue;
         }
         codex_success += 1;
-        deps.ensure_label(&label, existing_labels, &args.account, args.dry_run)?;
         grouped
             .entry(label.clone())
             .or_default()
@@ -338,6 +332,94 @@ fn regroup_by_alias(
     regrouped
 }
 
+fn ensure_grouped_labels_exist<D: AppDeps>(
+    deps: &D,
+    grouped: &HashMap<String, Vec<String>>,
+    args: &Args,
+    existing_labels: &mut HashSet<String>,
+) -> std::result::Result<(), DynErr> {
+    let mut labels = grouped
+        .iter()
+        .filter(|(_, ids)| !ids.is_empty())
+        .map(|(label, _)| label.as_str())
+        .collect::<Vec<_>>();
+    labels.sort_unstable();
+
+    for label in labels {
+        deps.ensure_label(label, existing_labels, &args.account, args.dry_run)?;
+    }
+
+    Ok(())
+}
+
+fn filter_recently_processed_keep_inbox_threads(
+    args: &Args,
+    cache: &CacheData,
+    threads: Vec<ThreadInfo>,
+) -> Vec<ThreadInfo> {
+    if !args.keep_inbox {
+        return threads;
+    }
+
+    let now = now_ts();
+    let ttl_seconds = args.cache_ttl_hours * 3600;
+    let mut skipped = 0usize;
+    let mut filtered = Vec::with_capacity(threads.len());
+
+    for thread in threads {
+        let content_key = memo_key(&thread.sender, &thread.subject, &thread.snippet);
+        let should_skip = cache
+            .processed_threads
+            .get(&thread.id)
+            .is_some_and(|entry| {
+                now.saturating_sub(entry.ts) <= ttl_seconds && entry.content_key == content_key
+            });
+        if should_skip {
+            skipped += 1;
+            continue;
+        }
+        filtered.push(thread);
+    }
+
+    if skipped > 0 {
+        log(&format!(
+            "KEEP_INBOX_SKIP: 跳过 {} 封已处理且内容未变化的线程",
+            skipped
+        ));
+    }
+
+    filtered
+}
+
+fn remember_processed_keep_inbox_threads(
+    cache: &mut CacheData,
+    threads: &[ThreadInfo],
+    processed_ids: &[String],
+) {
+    if processed_ids.is_empty() {
+        return;
+    }
+
+    let processed = processed_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let ts = now_ts();
+
+    for thread in threads {
+        if !processed.contains(thread.id.as_str()) {
+            continue;
+        }
+        cache.processed_threads.insert(
+            thread.id.clone(),
+            ProcessedThread {
+                content_key: memo_key(&thread.sender, &thread.subject, &thread.snippet),
+                ts,
+            },
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_once_with_deps<D: AppDeps>(
     deps: &D,
@@ -349,23 +431,28 @@ fn process_once_with_deps<D: AppDeps>(
     codex_checked: &mut bool,
     write_options: GmailWriteOptions,
 ) -> std::result::Result<(String, RoundMetrics), DynErr> {
-    let threads = deps.fetch_pending(args.limit, &args.account)?;
-    if threads.is_empty() {
+    let pending_threads = deps.fetch_pending(args.limit, &args.account)?;
+    if pending_threads.is_empty() {
         log("DONE_NO_PENDING: 没有待整理邮件，任务结束。");
         return Ok(("done".to_string(), RoundMetrics::default()));
     }
+    let threads =
+        filter_recently_processed_keep_inbox_threads(args, cache, pending_threads);
+    if threads.is_empty() {
+        log("IDLE_NO_ELIGIBLE: 当前仅命中已处理且内容未变化的线程，等待下轮。");
+        return Ok(("idle".to_string(), RoundMetrics::default()));
+    }
 
     let (mut grouped, mut processed_ids, codex_jobs, mut metrics) =
-        collect_threads(deps, args, cache, existing_labels, &threads)?;
+        collect_threads(args, cache, &threads)?;
     if !codex_jobs.is_empty() && !*codex_checked {
         deps.ensure_codex_ready(&args.codex_cmd)?;
         *codex_checked = true;
     }
     let (codex_success, codex_failures) = run_codex_for_jobs(
         deps,
-        args,
         cache,
-        existing_labels,
+        &args.codex_cmd,
         effective_workers,
         codex_pool,
         codex_jobs,
@@ -377,8 +464,13 @@ fn process_once_with_deps<D: AppDeps>(
 
     compress_labels_if_needed(cache, args.max_labels, &args.merged_label);
     let grouped = regroup_by_alias(grouped, cache);
+    ensure_grouped_labels_exist(deps, &grouped, args, existing_labels)?;
     deps.apply_labels(&grouped, &args.account, args.dry_run, write_options)?;
-    if !args.keep_inbox {
+    if args.keep_inbox {
+        if !args.dry_run {
+            remember_processed_keep_inbox_threads(cache, &threads, &processed_ids);
+        }
+    } else {
         deps.archive_threads(&processed_ids, &args.account, args.dry_run, write_options)?;
     }
 
@@ -507,9 +599,10 @@ pub(crate) fn run() -> Result<()> {
             args.feedback_hit_penalty,
             args.feedback_max_age_hours,
         )?;
-        if feedback_summary.applied_events > 0 {
+        if feedback_summary.total_events > 0 {
             log(&format!(
-                "FEEDBACK_APPLIED: events={} skipped={} affected_rules={} dropped_rules={}",
+                "FEEDBACK_APPLIED: total_events={} applied_events={} skipped={} affected_rules={} dropped_rules={}",
+                feedback_summary.total_events,
                 feedback_summary.applied_events,
                 feedback_summary.skipped_events,
                 feedback_summary.affected_rules,
@@ -597,6 +690,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::cache::memo_key;
     use crate::classify::{codex_error_hint, rule_matches};
     use crate::models::{
         DEFAULT_CACHE_FILE, DEFAULT_CACHE_MAX_MEMOS, DEFAULT_CACHE_MAX_RULES,
@@ -605,7 +699,7 @@ mod tests {
         DEFAULT_GMAIL_BATCH_RETRIES, DEFAULT_GMAIL_BATCH_RETRY_BACKOFF_SECS,
         DEFAULT_GMAIL_BATCH_SIZE, DEFAULT_MAX_ACTIVE_LABELS, DEFAULT_MERGED_LABEL, Rule, RuleInput,
     };
-    use crate::utils::normalize_label;
+    use crate::utils::{normalize_label, now_ts};
 
     struct MockDeps {
         pending: Vec<ThreadInfo>,
@@ -945,5 +1039,221 @@ mod tests {
         assert_eq!(metrics.codex_failures, 1);
         assert_eq!(*deps.codex_calls.lock().expect("lock poisoned"), 1);
         assert_eq!(*deps.codex_ready_calls.lock().expect("lock poisoned"), 1);
+    }
+
+    #[test]
+    fn test_process_once_ensures_merged_label_before_apply() {
+        let deps = MockDeps {
+            pending: vec![ThreadInfo {
+                id: "t-merge".to_string(),
+                sender: "calendar@example.com".to_string(),
+                subject: "meeting invite".to_string(),
+                snippet: "team sync".to_string(),
+            }],
+            codex_result: CodexClassify {
+                ok: true,
+                label: "会议".to_string(),
+                summary: "会议提醒".to_string(),
+                rule: RuleInput {
+                    description: "会议类邮件".to_string(),
+                    include_keywords: vec!["meeting".to_string()],
+                    exclude_keywords: vec![],
+                },
+            },
+            applied: Mutex::new(Vec::new()),
+            archived: Mutex::new(Vec::new()),
+            codex_calls: Mutex::new(0),
+            codex_ready_calls: Mutex::new(0),
+        };
+        let mut args = make_args();
+        args.max_labels = 2;
+        args.merged_label = "统一收纳".to_string();
+
+        let mut cache = CacheData::default();
+        cache.rules.push(Rule {
+            id: "r-finance".to_string(),
+            label: "财务".to_string(),
+            include_keywords: vec!["invoice".to_string()],
+            hits: 10,
+            updated_at: 100,
+            ..Default::default()
+        });
+        cache.rules.push(Rule {
+            id: "r-subscription".to_string(),
+            label: "订阅".to_string(),
+            include_keywords: vec!["newsletter".to_string()],
+            hits: 9,
+            updated_at: 90,
+            ..Default::default()
+        });
+
+        let mut existing_labels = HashSet::new();
+        let mut codex_pool: Option<ThreadPool> = None;
+        let mut codex_checked = false;
+
+        let (state, metrics) = process_once_with_deps(
+            &deps,
+            &args,
+            &mut cache,
+            &mut existing_labels,
+            1,
+            &mut codex_pool,
+            &mut codex_checked,
+            GmailWriteOptions {
+                batch_size: args.gmail_batch_size,
+                batch_retries: args.gmail_batch_retries,
+                batch_retry_backoff_secs: args.gmail_batch_retry_backoff_secs,
+            },
+        )
+        .expect("process_once should succeed");
+
+        assert_eq!(state, "processed");
+        assert_eq!(metrics.codex_success, 1);
+        assert!(existing_labels.contains("统一收纳"));
+        assert!(!existing_labels.contains("会议"));
+
+        let applied = deps.applied.lock().expect("lock poisoned");
+        assert_eq!(applied.len(), 1);
+        let grouped = &applied[0];
+        let ids = grouped
+            .get("统一收纳")
+            .expect("expected merged label to be applied");
+        assert_eq!(ids, &vec!["t-merge".to_string()]);
+    }
+
+    #[test]
+    fn test_keep_inbox_skips_recently_processed_unchanged_threads() {
+        let thread = ThreadInfo {
+            id: "t-keep".to_string(),
+            sender: "alerts@example.com".to_string(),
+            subject: "weekly digest".to_string(),
+            snippet: "same content".to_string(),
+        };
+        let deps = MockDeps {
+            pending: vec![thread.clone()],
+            codex_result: CodexClassify {
+                ok: true,
+                label: "订阅".to_string(),
+                summary: "订阅邮件".to_string(),
+                rule: RuleInput {
+                    description: "订阅类邮件".to_string(),
+                    include_keywords: vec!["digest".to_string()],
+                    exclude_keywords: vec![],
+                },
+            },
+            applied: Mutex::new(Vec::new()),
+            archived: Mutex::new(Vec::new()),
+            codex_calls: Mutex::new(0),
+            codex_ready_calls: Mutex::new(0),
+        };
+        let mut args = make_args();
+        args.keep_inbox = true;
+
+        let mut cache = CacheData::default();
+        cache.processed_threads.insert(
+            thread.id.clone(),
+            ProcessedThread {
+                content_key: memo_key(&thread.sender, &thread.subject, &thread.snippet),
+                ts: now_ts(),
+            },
+        );
+
+        let mut existing_labels = HashSet::new();
+        let mut codex_pool: Option<ThreadPool> = None;
+        let mut codex_checked = false;
+
+        let (state, metrics) = process_once_with_deps(
+            &deps,
+            &args,
+            &mut cache,
+            &mut existing_labels,
+            1,
+            &mut codex_pool,
+            &mut codex_checked,
+            GmailWriteOptions {
+                batch_size: args.gmail_batch_size,
+                batch_retries: args.gmail_batch_retries,
+                batch_retry_backoff_secs: args.gmail_batch_retry_backoff_secs,
+            },
+        )
+        .expect("process_once should succeed");
+
+        assert_eq!(state, "idle");
+        assert_eq!(metrics.total_threads, 0);
+        assert_eq!(*deps.codex_calls.lock().expect("lock poisoned"), 0);
+        assert!(deps.applied.lock().expect("lock poisoned").is_empty());
+        assert!(deps.archived.lock().expect("lock poisoned").is_empty());
+    }
+
+    #[test]
+    fn test_keep_inbox_reprocesses_thread_when_content_changes() {
+        let thread = ThreadInfo {
+            id: "t-keep-change".to_string(),
+            sender: "alerts@example.com".to_string(),
+            subject: "weekly digest".to_string(),
+            snippet: "new content".to_string(),
+        };
+        let deps = MockDeps {
+            pending: vec![thread.clone()],
+            codex_result: CodexClassify {
+                ok: true,
+                label: "订阅".to_string(),
+                summary: "订阅邮件".to_string(),
+                rule: RuleInput {
+                    description: "订阅类邮件".to_string(),
+                    include_keywords: vec!["digest".to_string()],
+                    exclude_keywords: vec![],
+                },
+            },
+            applied: Mutex::new(Vec::new()),
+            archived: Mutex::new(Vec::new()),
+            codex_calls: Mutex::new(0),
+            codex_ready_calls: Mutex::new(0),
+        };
+        let mut args = make_args();
+        args.keep_inbox = true;
+
+        let mut cache = CacheData::default();
+        cache.processed_threads.insert(
+            thread.id.clone(),
+            ProcessedThread {
+                content_key: memo_key(&thread.sender, &thread.subject, "old content"),
+                ts: now_ts(),
+            },
+        );
+
+        let mut existing_labels = HashSet::new();
+        let mut codex_pool: Option<ThreadPool> = None;
+        let mut codex_checked = false;
+
+        let (state, metrics) = process_once_with_deps(
+            &deps,
+            &args,
+            &mut cache,
+            &mut existing_labels,
+            1,
+            &mut codex_pool,
+            &mut codex_checked,
+            GmailWriteOptions {
+                batch_size: args.gmail_batch_size,
+                batch_retries: args.gmail_batch_retries,
+                batch_retry_backoff_secs: args.gmail_batch_retry_backoff_secs,
+            },
+        )
+        .expect("process_once should succeed");
+
+        assert_eq!(state, "processed");
+        assert_eq!(metrics.codex_success, 1);
+        assert_eq!(*deps.codex_calls.lock().expect("lock poisoned"), 1);
+        assert!(deps.archived.lock().expect("lock poisoned").is_empty());
+        assert!(cache.processed_threads.contains_key("t-keep-change"));
+        let saved = cache
+            .processed_threads
+            .get("t-keep-change")
+            .expect("processed thread should be stored");
+        assert_eq!(
+            saved.content_key,
+            memo_key(&thread.sender, &thread.subject, &thread.snippet)
+        );
     }
 }

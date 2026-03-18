@@ -21,8 +21,11 @@ pub(crate) fn build_rule_priority_indexes(cache: &CacheData) -> Vec<usize> {
     indexes
 }
 
-pub(crate) fn rule_matches(rule: &Rule, sender: &str, subject: &str, snippet: &str) -> bool {
-    let text = format!("{} {} {}", sender, subject, snippet).to_lowercase();
+fn normalized_match_text(sender: &str, subject: &str, snippet: &str) -> String {
+    format!("{sender} {subject} {snippet}").to_lowercase()
+}
+
+fn rule_matches_text(rule: &Rule, text: &str) -> bool {
     let mut has_include = false;
     let mut include_matched = false;
     for raw in &rule.include_keywords {
@@ -53,6 +56,12 @@ pub(crate) fn rule_matches(rule: &Rule, sender: &str, subject: &str, snippet: &s
     has_include
 }
 
+#[cfg(test)]
+pub(crate) fn rule_matches(rule: &Rule, sender: &str, subject: &str, snippet: &str) -> bool {
+    let text = normalized_match_text(sender, subject, snippet);
+    rule_matches_text(rule, &text)
+}
+
 pub(crate) fn classify_from_cache_with_indexes(
     sender: &str,
     subject: &str,
@@ -73,13 +82,14 @@ pub(crate) fn classify_from_cache_with_indexes(
         }
     }
 
+    let match_text = normalized_match_text(sender, subject, snippet);
     for &idx in rule_indexes {
         if idx >= cache.rules.len() {
             continue;
         }
         let matched = {
             let rule = &cache.rules[idx];
-            rule_matches(rule, sender, subject, snippet)
+            rule_matches_text(rule, &match_text)
         };
         if !matched {
             continue;

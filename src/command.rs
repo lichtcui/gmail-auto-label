@@ -1,25 +1,94 @@
+use std::io::Read;
 use std::process::{Command, Stdio};
+use std::thread;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use wait_timeout::ChildExt;
+
+fn spawn_output_reader<R: Read + Send + 'static>(
+    mut reader: R,
+) -> thread::JoinHandle<Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf)?;
+        Ok(buf)
+    })
+}
+
+fn join_output_reader(
+    handle: thread::JoinHandle<Result<Vec<u8>>>,
+    stream_name: &str,
+) -> Result<Vec<u8>> {
+    handle
+        .join()
+        .map_err(|_| anyhow!("{stream_name} 读取线程异常退出"))?
+        .with_context(|| format!("读取 {stream_name} 输出失败"))
+}
 
 fn run_cmd_with_timeout(mut cmd: Command, timeout_secs: u64) -> Result<(i32, String, String)> {
     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("无法获取子进程 stdout 管道")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("无法获取子进程 stderr 管道")?;
+    let stdout_handle = spawn_output_reader(stdout);
+    let stderr_handle = spawn_output_reader(stderr);
 
     let timeout = Duration::from_secs(timeout_secs);
-    let status_opt = child.wait_timeout(timeout)?;
-    if status_opt.is_none() {
-        let _ = child.kill();
-        let _ = child.wait();
-        bail!("命令超时（{}s）", timeout_secs);
+    let status = match child.wait_timeout(timeout)? {
+        Some(status) => status,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_handle.join();
+            let _ = stderr_handle.join();
+            bail!("命令超时（{}s）", timeout_secs);
+        }
+    };
+
+    let stdout = join_output_reader(stdout_handle, "stdout")?;
+    let stderr = join_output_reader(stderr_handle, "stderr")?;
+    let code = status.code().unwrap_or(-1);
+    Ok((
+        code,
+        String::from_utf8_lossy(&stdout).to_string(),
+        String::from_utf8_lossy(&stderr).to_string(),
+    ))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_run_cmd_with_timeout_handles_large_output_without_deadlock() {
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "dd if=/dev/zero bs=65536 count=4 2>/dev/null; dd if=/dev/zero bs=65536 count=4 1>&2 2>/dev/null",
+        ]);
+
+        let (code, stdout, stderr) =
+            run_cmd_with_timeout(cmd, 5).expect("command should complete");
+
+        assert_eq!(code, 0);
+        assert!(stdout.len() >= 4 * 65536);
+        assert!(stderr.len() >= 4 * 65536);
     }
 
-    let output = child.wait_with_output()?;
-    let code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    Ok((code, stdout, stderr))
+    #[test]
+    fn test_run_cmd_with_timeout_returns_timeout_error() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 2"]);
+
+        let err = run_cmd_with_timeout(cmd, 1).expect_err("command should time out");
+        assert!(err.to_string().contains("命令超时"));
+    }
 }
 
 pub(crate) trait CommandRunner {

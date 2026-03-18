@@ -97,6 +97,14 @@ pub(crate) struct Memo {
     pub(crate) ts: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(crate) struct ProcessedThread {
+    #[serde(default)]
+    pub(crate) content_key: String,
+    #[serde(default)]
+    pub(crate) ts: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CacheData {
     pub(crate) version: String,
@@ -104,6 +112,8 @@ pub(crate) struct CacheData {
     pub(crate) rules: Vec<Rule>,
     #[serde(default)]
     pub(crate) memos: HashMap<String, Memo>,
+    #[serde(default)]
+    pub(crate) processed_threads: HashMap<String, ProcessedThread>,
     #[serde(default)]
     pub(crate) label_aliases: HashMap<String, String>,
     #[serde(default)]
@@ -116,6 +126,7 @@ impl Default for CacheData {
             version: CACHE_VERSION.to_string(),
             rules: Vec::new(),
             memos: HashMap::new(),
+            processed_threads: HashMap::new(),
             label_aliases: HashMap::new(),
             feedback_applied_ids: Vec::new(),
         }

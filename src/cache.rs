@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -8,7 +10,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::models::{CACHE_VERSION, CacheData, DEFAULT_FEEDBACK_MAX_APPLIED_IDS};
-use crate::utils::{normalize_label, now_ts};
+use crate::utils::{log, normalize_label, now_ts};
 
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
@@ -47,17 +49,31 @@ pub(crate) fn load_cache(path: &str) -> CacheData {
     if !p.exists() {
         return CacheData::default();
     }
-    match fs::read_to_string(p)
-        .ok()
-        .and_then(|s| serde_json::from_str::<CacheData>(&s).ok())
-    {
-        Some(mut cache) => {
-            cache.version = CACHE_VERSION.to_string();
-            normalize_cache_rules(&mut cache);
-            cache
+    let raw = match fs::read_to_string(p) {
+        Ok(raw) => raw,
+        Err(err) => {
+            log(&format!(
+                "WARN_LOAD_CACHE: 读取缓存失败，已忽略 {}: {}",
+                p.display(),
+                err
+            ));
+            return CacheData::default();
         }
-        None => CacheData::default(),
-    }
+    };
+    let mut cache = match serde_json::from_str::<CacheData>(&raw) {
+        Ok(cache) => cache,
+        Err(err) => {
+            log(&format!(
+                "WARN_LOAD_CACHE: 解析缓存失败，已忽略 {}: {}",
+                p.display(),
+                err
+            ));
+            return CacheData::default();
+        }
+    };
+    cache.version = CACHE_VERSION.to_string();
+    normalize_cache_rules(&mut cache);
+    cache
 }
 
 pub(crate) fn save_cache(path: &str, cache: &CacheData) -> Result<()> {
@@ -66,8 +82,23 @@ pub(crate) fn save_cache(path: &str, cache: &CacheData) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("创建缓存目录失败: {}", parent.display()))?;
     }
-    let body = serde_json::to_string_pretty(cache)?;
-    fs::write(p, body).with_context(|| format!("写缓存失败: {}", p.display()))
+    let body = serde_json::to_vec_pretty(cache)?;
+    let tmp = temp_cache_path(p);
+    {
+        let mut file = fs::File::create(&tmp)
+            .with_context(|| format!("创建缓存临时文件失败: {}", tmp.display()))?;
+        file.write_all(&body)
+            .with_context(|| format!("写缓存临时文件失败: {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("同步缓存临时文件失败: {}", tmp.display()))?;
+    }
+    fs::rename(&tmp, p).with_context(|| {
+        format!(
+            "替换缓存文件失败: {} -> {}",
+            tmp.display(),
+            p.display()
+        )
+    })
 }
 
 pub(crate) fn cache_fingerprint(cache: &CacheData) -> Result<String> {
@@ -79,6 +110,7 @@ pub(crate) fn cache_fingerprint(cache: &CacheData) -> Result<String> {
 
 #[derive(Debug, Default)]
 pub(crate) struct FeedbackApplySummary {
+    pub(crate) total_events: usize,
     pub(crate) applied_events: usize,
     pub(crate) skipped_events: usize,
     pub(crate) affected_rules: usize,
@@ -184,6 +216,7 @@ pub(crate) fn apply_feedback_from_file(
         cache.memos.retain(|_, m| !dropped_ids.contains(&m.rule_id));
     }
 
+    let applied_events = applied_event_ids.len();
     if !applied_event_ids.is_empty() {
         cache.feedback_applied_ids.extend(applied_event_ids.clone());
         if cache.feedback_applied_ids.len() > DEFAULT_FEEDBACK_MAX_APPLIED_IDS {
@@ -198,7 +231,8 @@ pub(crate) fn apply_feedback_from_file(
     fs::write(path, "[]").with_context(|| format!("重置反馈文件失败: {}", path.display()))?;
 
     Ok(FeedbackApplySummary {
-        applied_events: entries.len(),
+        total_events: entries.len(),
+        applied_events,
         skipped_events,
         affected_rules,
         dropped_rules,
@@ -219,6 +253,10 @@ pub(crate) fn prune_cache(
         .memos
         .retain(|_, memo| now - memo.ts <= ttl_seconds && normalize_label(&memo.label) != "待分类");
 
+    cache
+        .processed_threads
+        .retain(|_, entry| now - entry.ts <= ttl_seconds && !entry.content_key.trim().is_empty());
+
     if cache.memos.len() > max_memos {
         let mut pairs: Vec<(String, i64)> =
             cache.memos.iter().map(|(k, v)| (k.clone(), v.ts)).collect();
@@ -226,6 +264,19 @@ pub(crate) fn prune_cache(
         let drop_count = cache.memos.len() - max_memos;
         for (k, _) in pairs.into_iter().take(drop_count) {
             cache.memos.remove(&k);
+        }
+    }
+
+    if cache.processed_threads.len() > max_memos {
+        let mut pairs: Vec<(String, i64)> = cache
+            .processed_threads
+            .iter()
+            .map(|(k, v)| (k.clone(), v.ts))
+            .collect();
+        pairs.sort_by_key(|(_, ts)| *ts);
+        let drop_count = cache.processed_threads.len() - max_memos;
+        for (k, _) in pairs.into_iter().take(drop_count) {
+            cache.processed_threads.remove(&k);
         }
     }
 
@@ -267,12 +318,24 @@ fn normalize_keywords(keywords: &[String]) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
+fn temp_cache_path(path: &Path) -> std::path::PathBuf {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("cache.json");
+    path.with_file_name(format!(".{file_name}.tmp-{}-{ts}", std::process::id()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::models::Rule;
+    use crate::models::{ProcessedThread, Rule};
     use crate::utils::now_ts;
 
     fn tmp_feedback_file() -> String {
@@ -281,6 +344,14 @@ mod tests {
             .unwrap_or_default()
             .as_nanos();
         format!("/tmp/gmail_feedback_test_{ts}.json")
+    }
+
+    fn tmp_cache_file() -> String {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("/tmp/gmail_cache_test_{ts}.json")
     }
 
     #[test]
@@ -306,6 +377,7 @@ mod tests {
 
         let summary = apply_feedback_from_file(&mut cache, &path, 3, 2, 24 * 7)
             .expect("apply feedback failed");
+        assert_eq!(summary.total_events, 3);
         assert_eq!(summary.applied_events, 3);
         assert_eq!(summary.dropped_rules, 1);
         assert!(cache.rules.is_empty());
@@ -340,11 +412,56 @@ mod tests {
 
         let summary = apply_feedback_from_file(&mut cache, &path, 3, 2, 24 * 7)
             .expect("apply feedback failed");
-        assert_eq!(summary.applied_events, 3);
+        assert_eq!(summary.total_events, 3);
+        assert_eq!(summary.applied_events, 0);
         assert_eq!(summary.skipped_events, 3);
         assert_eq!(summary.affected_rules, 0);
         assert_eq!(summary.dropped_rules, 0);
         assert_eq!(cache.rules[0].hits, 10);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_save_and_load_cache_roundtrip() {
+        let path = tmp_cache_file();
+        let mut cache = CacheData::default();
+        cache.rules.push(Rule {
+            id: "r1".to_string(),
+            label: "账单".to_string(),
+            include_keywords: vec![" invoice ".to_string()],
+            ..Default::default()
+        });
+        cache.processed_threads.insert(
+            "t1".to_string(),
+            ProcessedThread {
+                content_key: "memo:abc".to_string(),
+                ts: now_ts(),
+            },
+        );
+
+        save_cache(&path, &cache).expect("save cache should succeed");
+        let loaded = load_cache(&path);
+
+        assert_eq!(loaded.version, CACHE_VERSION);
+        assert_eq!(loaded.rules.len(), 1);
+        assert_eq!(loaded.rules[0].include_keywords, vec!["invoice".to_string()]);
+        assert!(loaded.processed_threads.contains_key("t1"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_cache_returns_default_for_invalid_json() {
+        let path = tmp_cache_file();
+        fs::write(&path, "{invalid json").expect("write invalid cache");
+
+        let loaded = load_cache(&path);
+
+        assert_eq!(loaded.version, CACHE_VERSION);
+        assert!(loaded.rules.is_empty());
+        assert!(loaded.memos.is_empty());
+        assert!(loaded.processed_threads.is_empty());
 
         let _ = fs::remove_file(&path);
     }
