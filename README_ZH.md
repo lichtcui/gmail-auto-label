@@ -1,6 +1,6 @@
 # gmail-auto-label (Rust)
 
-[![Documentation](https://docs.rs/gmail-auto-label/badge.svg)](https://docs.rs/gmail-auto-label)
+[![Documentation](https://img.shields.io/badge/docs-docs.rs-blue)](https://docs.rs/crate/gmail-auto-label/latest)
 [![License](https://img.shields.io/github/license/lichtcui/gmail-auto-label)](LICENSE)
 [![Crates.io](https://img.shields.io/crates/v/gmail-auto-label.svg)](https://crates.io/crates/gmail-auto-label)
 [![Crates.io](https://img.shields.io/crates/d/gmail-auto-label.svg)](https://crates.io/crates/gmail-auto-label)
