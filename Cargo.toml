@@ -1,0 +1,21 @@
+[package]
+name = "gmail-auto-label"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Automatic Gmail labeling tool powered by gog and codex"
+readme = "README.md"
+license = "MIT"
+keywords = ["gmail", "automation", "cli", "email", "labeling"]
+categories = ["command-line-utilities", "email"]
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+rayon = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+shell-words = "1.1"
+wait-timeout = "0.2"
