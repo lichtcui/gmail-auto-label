@@ -99,7 +99,7 @@ cargo install gmail-auto-label
 可选：指定版本安装
 
 ```bash
-cargo install gmail-auto-label --version 0.1.0
+cargo install gmail-auto-label --version 0.1.1
 ```
 
 ## 常用用法

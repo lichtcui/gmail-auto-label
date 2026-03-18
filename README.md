@@ -99,7 +99,7 @@ cargo install gmail-auto-label
 Optional (pin a version):
 
 ```bash
-cargo install gmail-auto-label --version 0.1.0
+cargo install gmail-auto-label --version 0.1.1
 ```
 
 ## Common Usage
