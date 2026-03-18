@@ -1,9 +1,14 @@
 # gmail-auto-label (Rust)
 
+[![Documentation](https://docs.rs/gmail-auto-label/badge.svg)](https://docs.rs/gmail-auto-label)
+[![License](https://img.shields.io/crates/l/gmail-auto-label.svg)](https://crates.io/crates/gmail-auto-label)
+[![Crates.io](https://img.shields.io/crates/v/gmail-auto-label.svg)](https://crates.io/crates/gmail-auto-label)
+[![Crates.io](https://img.shields.io/crates/d/gmail-auto-label.svg)](https://crates.io/crates/gmail-auto-label)
+
 An automatic Gmail labeling tool built with `gog` + `codex` (Rust version).  
 This is the primary documentation.
 
-Chinese version: [README_ZH.md](README_ZH.md)
+🌐 Languages: [🇺🇸 English](README.md) · [🇨🇳 简体中文](README_ZH.md)
 
 ## Features
 
@@ -138,6 +143,30 @@ cargo run -- --keep-inbox
 - `--merged-label`: merge target when labels exceed limit, default `其他通知`
 - `--codex-workers`: Codex concurrency, `0` means auto
 - `--keep-inbox`: do not remove processed threads from inbox
+- `--gmail-batch-size`: Gmail modify batch size, default `100`
+- `--gmail-batch-retries`: retries per Gmail write batch, default `2`
+- `--gmail-batch-retry-backoff-secs`: backoff seconds between batch retries, default `1`
+- `--feedback-file`: feedback file path, default `/tmp/gmail_auto_label_feedback.json`
+- `--feedback-bad-threshold`: drop rule when bad feedback count reaches this threshold, default `3`
+- `--feedback-hit-penalty`: reduce rule hits per bad feedback event, default `2`
+- `--feedback-max-age-hours`: max accepted age of feedback events, default `336`
+
+Feedback file format (`--feedback-file`):
+
+```json
+[
+  {
+    "event_id": "evt-20260318-001",
+    "rule_id": "rule_sha256_id",
+    "verdict": "bad",
+    "ts": 1773800000
+  }
+]
+```
+
+Notes:
+- `event_id` must be unique; duplicated/replayed events are skipped.
+- `ts` uses Unix seconds; stale events older than `--feedback-max-age-hours` are skipped.
 
 ## Help
 

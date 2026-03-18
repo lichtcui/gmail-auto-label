@@ -1,0 +1,945 @@
+use std::collections::{HashMap, HashSet};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, anyhow, bail};
+use clap::Parser;
+use rayon::ThreadPool;
+use rayon::prelude::*;
+
+use crate::cache::{
+    apply_feedback_from_file, cache_fingerprint, load_cache, prune_cache, save_cache,
+};
+use crate::classify::{
+    build_rule_priority_indexes, classify_from_cache_with_indexes, classify_with_codex_result,
+    codex_analyze_email, codex_error_hint, compress_labels_if_needed,
+    ensure_codex_command_available,
+};
+use crate::errors::AppError;
+use crate::gog::{
+    GmailWriteOptions, apply_labels_with_options, archive_threads_with_options, ensure_label,
+    fetch_existing_labels, fetch_pending,
+};
+use crate::models::{Args, CacheData, CodexClassify, ThreadInfo};
+use crate::utils::{auto_codex_workers, log, resolve_label_alias};
+
+type DynErr = AppError;
+
+#[derive(Debug, Default, Clone)]
+struct RoundMetrics {
+    total_threads: usize,
+    cache_hits: usize,
+    codex_jobs: usize,
+    codex_success: usize,
+    codex_failures: usize,
+}
+
+#[derive(Debug, Clone)]
+struct AdaptiveWriteTuner {
+    current: GmailWriteOptions,
+    baseline: GmailWriteOptions,
+    consecutive_success: u32,
+}
+
+impl AdaptiveWriteTuner {
+    fn new(baseline: GmailWriteOptions) -> Self {
+        Self {
+            current: baseline,
+            baseline,
+            consecutive_success: 0,
+        }
+    }
+
+    fn on_rate_limit(&mut self) {
+        self.consecutive_success = 0;
+        self.current.batch_size = std::cmp::max(10, self.current.batch_size / 2);
+        self.current.batch_retries = std::cmp::min(self.current.batch_retries + 1, 6);
+        self.current.batch_retry_backoff_secs =
+            std::cmp::min(self.current.batch_retry_backoff_secs.saturating_mul(2), 30);
+    }
+
+    fn on_success(&mut self) {
+        self.consecutive_success += 1;
+        if self.consecutive_success < 3 {
+            return;
+        }
+        self.consecutive_success = 0;
+        if self.current.batch_size < self.baseline.batch_size {
+            self.current.batch_size =
+                std::cmp::min(self.current.batch_size + 10, self.baseline.batch_size);
+        }
+        if self.current.batch_retries > self.baseline.batch_retries {
+            self.current.batch_retries -= 1;
+        }
+        if self.current.batch_retry_backoff_secs > self.baseline.batch_retry_backoff_secs {
+            self.current.batch_retry_backoff_secs -= 1;
+        }
+    }
+}
+
+trait AppDeps: Sync {
+    fn fetch_pending(
+        &self,
+        limit: usize,
+        account: &Option<String>,
+    ) -> std::result::Result<Vec<ThreadInfo>, DynErr>;
+    fn ensure_label(
+        &self,
+        label: &str,
+        existing_labels: &mut HashSet<String>,
+        account: &Option<String>,
+        dry_run: bool,
+    ) -> std::result::Result<(), DynErr>;
+    fn codex_analyze_email(
+        &self,
+        sender: &str,
+        subject: &str,
+        snippet: &str,
+        codex_cmd: &str,
+    ) -> CodexClassify;
+    fn ensure_codex_ready(&self, codex_cmd: &str) -> std::result::Result<(), DynErr>;
+    fn apply_labels(
+        &self,
+        grouped: &HashMap<String, Vec<String>>,
+        account: &Option<String>,
+        dry_run: bool,
+        write_options: GmailWriteOptions,
+    ) -> std::result::Result<(), DynErr>;
+    fn archive_threads(
+        &self,
+        thread_ids: &[String],
+        account: &Option<String>,
+        dry_run: bool,
+        write_options: GmailWriteOptions,
+    ) -> std::result::Result<(), DynErr>;
+}
+
+struct RealDeps;
+
+impl AppDeps for RealDeps {
+    fn fetch_pending(
+        &self,
+        limit: usize,
+        account: &Option<String>,
+    ) -> std::result::Result<Vec<ThreadInfo>, DynErr> {
+        fetch_pending(limit, account)
+    }
+
+    fn ensure_label(
+        &self,
+        label: &str,
+        existing_labels: &mut HashSet<String>,
+        account: &Option<String>,
+        dry_run: bool,
+    ) -> std::result::Result<(), DynErr> {
+        ensure_label(label, existing_labels, account, dry_run)
+    }
+
+    fn codex_analyze_email(
+        &self,
+        sender: &str,
+        subject: &str,
+        snippet: &str,
+        codex_cmd: &str,
+    ) -> CodexClassify {
+        codex_analyze_email(sender, subject, snippet, codex_cmd)
+    }
+
+    fn ensure_codex_ready(&self, codex_cmd: &str) -> std::result::Result<(), DynErr> {
+        ensure_codex_command_available(codex_cmd)
+            .map_err(|e| build_codex_setup_error(&e.to_string(), codex_cmd))
+    }
+
+    fn apply_labels(
+        &self,
+        grouped: &HashMap<String, Vec<String>>,
+        account: &Option<String>,
+        dry_run: bool,
+        write_options: GmailWriteOptions,
+    ) -> std::result::Result<(), DynErr> {
+        apply_labels_with_options(grouped, account, dry_run, write_options)
+    }
+
+    fn archive_threads(
+        &self,
+        thread_ids: &[String],
+        account: &Option<String>,
+        dry_run: bool,
+        write_options: GmailWriteOptions,
+    ) -> std::result::Result<(), DynErr> {
+        archive_threads_with_options(thread_ids, account, dry_run, write_options)
+    }
+}
+
+fn collect_threads<D: AppDeps>(
+    deps: &D,
+    args: &Args,
+    cache: &mut CacheData,
+    existing_labels: &mut HashSet<String>,
+    threads: &[ThreadInfo],
+) -> std::result::Result<
+    (
+        HashMap<String, Vec<String>>,
+        Vec<String>,
+        Vec<ThreadInfo>,
+        RoundMetrics,
+    ),
+    DynErr,
+> {
+    let rule_indexes = build_rule_priority_indexes(cache);
+    let mut metrics = RoundMetrics {
+        total_threads: threads.len(),
+        ..RoundMetrics::default()
+    };
+    let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
+    let mut processed_ids: Vec<String> = Vec::new();
+    let mut codex_jobs: Vec<ThreadInfo> = Vec::new();
+
+    for t in threads {
+        if let Some((label, source)) = classify_from_cache_with_indexes(
+            &t.sender,
+            &t.subject,
+            &t.snippet,
+            cache,
+            args.cache_ttl_hours,
+            &rule_indexes,
+        ) {
+            metrics.cache_hits += 1;
+            deps.ensure_label(&label, existing_labels, &args.account, args.dry_run)?;
+            grouped.entry(label.clone()).or_default().push(t.id.clone());
+            processed_ids.push(t.id.clone());
+            log(&format!(
+                "分类: 线程={} 标签={} 来源={} 总结=缓存命中",
+                t.id, label, source
+            ));
+        } else {
+            codex_jobs.push(t.clone());
+        }
+    }
+
+    metrics.codex_jobs = codex_jobs.len();
+    Ok((grouped, processed_ids, codex_jobs, metrics))
+}
+
+fn run_codex_for_jobs<D: AppDeps>(
+    deps: &D,
+    args: &Args,
+    cache: &mut CacheData,
+    existing_labels: &mut HashSet<String>,
+    effective_workers: usize,
+    codex_pool: &mut Option<ThreadPool>,
+    codex_jobs: Vec<ThreadInfo>,
+    grouped: &mut HashMap<String, Vec<String>>,
+    processed_ids: &mut Vec<String>,
+) -> std::result::Result<(usize, usize), DynErr> {
+    if codex_jobs.is_empty() {
+        return Ok((0, 0));
+    }
+
+    log(&format!(
+        "缓存未命中 {} 封，使用 {} 并发调用 Codex...",
+        codex_jobs.len(),
+        effective_workers
+    ));
+
+    let codex_cmd = args.codex_cmd.clone();
+    let results = if effective_workers <= 1 {
+        codex_jobs
+            .into_iter()
+            .map(|job| {
+                let res =
+                    deps.codex_analyze_email(&job.sender, &job.subject, &job.snippet, &codex_cmd);
+                (job, res)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        if codex_pool.is_none() {
+            *codex_pool = Some(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(effective_workers)
+                    .build()
+                    .context("创建 Codex 线程池失败")?,
+            );
+        }
+        let pool = codex_pool.as_ref().context("Codex 线程池未初始化")?;
+        pool.install(|| {
+            codex_jobs
+                .into_par_iter()
+                .map(|job| {
+                    let res = deps.codex_analyze_email(
+                        &job.sender,
+                        &job.subject,
+                        &job.snippet,
+                        &codex_cmd,
+                    );
+                    (job, res)
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+
+    let total_results = results.len();
+    let mut codex_setup_failures = 0usize;
+    let mut codex_success = 0usize;
+    let mut codex_failures = 0usize;
+
+    for (job, result) in results {
+        let (label, source, summary) =
+            classify_with_codex_result(&job.sender, &job.subject, &job.snippet, cache, &result);
+        if source == "codex:error" && label == "待分类" {
+            let hint = codex_error_hint(&summary).unwrap_or("请检查 codex 环境后重试。");
+            if matches!(summary.as_str(), "codex_not_found" | "codex_non_zero_exit") {
+                codex_setup_failures += 1;
+            }
+            log(&format!(
+                "分类失败: 线程={}，原因={}。{} 已跳过打标，等待下轮重试。",
+                job.id, summary, hint
+            ));
+            codex_failures += 1;
+            continue;
+        }
+        codex_success += 1;
+        deps.ensure_label(&label, existing_labels, &args.account, args.dry_run)?;
+        grouped
+            .entry(label.clone())
+            .or_default()
+            .push(job.id.clone());
+        processed_ids.push(job.id.clone());
+        log(&format!(
+            "分类: 线程={} 标签={} 来源={} 总结={}",
+            job.id, label, source, summary
+        ));
+    }
+
+    if total_results > 0 && codex_setup_failures == total_results {
+        return Err(AppError::Config(format!(
+            "Codex 配置不可用：本轮所有未命中缓存邮件都因 codex 配置问题失败。请先修复 codex 后重试。"
+        )));
+    }
+
+    Ok((codex_success, codex_failures))
+}
+
+fn regroup_by_alias(
+    grouped: HashMap<String, Vec<String>>,
+    cache: &CacheData,
+) -> HashMap<String, Vec<String>> {
+    if cache.label_aliases.is_empty() {
+        return grouped;
+    }
+    let mut regrouped: HashMap<String, Vec<String>> = HashMap::new();
+    for (label, ids) in grouped {
+        let final_label = resolve_label_alias(&label, cache);
+        regrouped.entry(final_label).or_default().extend(ids);
+    }
+    regrouped
+}
+
+fn process_once_with_deps<D: AppDeps>(
+    deps: &D,
+    args: &Args,
+    cache: &mut CacheData,
+    existing_labels: &mut HashSet<String>,
+    effective_workers: usize,
+    codex_pool: &mut Option<ThreadPool>,
+    codex_checked: &mut bool,
+    write_options: GmailWriteOptions,
+) -> std::result::Result<(String, RoundMetrics), DynErr> {
+    let threads = deps.fetch_pending(args.limit, &args.account)?;
+    if threads.is_empty() {
+        log("DONE_NO_PENDING: 没有待整理邮件，任务结束。");
+        return Ok(("done".to_string(), RoundMetrics::default()));
+    }
+
+    let (mut grouped, mut processed_ids, codex_jobs, mut metrics) =
+        collect_threads(deps, args, cache, existing_labels, &threads)?;
+    if !codex_jobs.is_empty() && !*codex_checked {
+        deps.ensure_codex_ready(&args.codex_cmd)?;
+        *codex_checked = true;
+    }
+    let (codex_success, codex_failures) = run_codex_for_jobs(
+        deps,
+        args,
+        cache,
+        existing_labels,
+        effective_workers,
+        codex_pool,
+        codex_jobs,
+        &mut grouped,
+        &mut processed_ids,
+    )?;
+    metrics.codex_success = codex_success;
+    metrics.codex_failures = codex_failures;
+
+    compress_labels_if_needed(cache, args.max_labels, &args.merged_label);
+    let grouped = regroup_by_alias(grouped, cache);
+    deps.apply_labels(&grouped, &args.account, args.dry_run, write_options)?;
+    if !args.keep_inbox {
+        deps.archive_threads(&processed_ids, &args.account, args.dry_run, write_options)?;
+    }
+
+    let total: usize = grouped.values().map(Vec::len).sum();
+    let mut keys: Vec<String> = grouped.keys().cloned().collect();
+    keys.sort();
+    let summary = keys
+        .into_iter()
+        .filter_map(|k| grouped.get(&k).map(|ids| (k, ids.len())))
+        .filter(|(_, n)| *n > 0)
+        .map(|(k, n)| format!("{}:{}", k, n))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    log(&format!("本轮完成: 总计={} | {}", total, summary));
+
+    Ok(("processed".to_string(), metrics))
+}
+
+fn validate_args(args: &Args) -> Result<()> {
+    if args.limit == 0 {
+        bail!("--limit 必须大于 0");
+    }
+    if args.interval == 0 {
+        bail!("--interval 必须大于 0");
+    }
+    if args.cache_ttl_hours <= 0 {
+        bail!("--cache-ttl-hours 必须大于 0");
+    }
+    if args.cache_max_rules == 0 {
+        bail!("--cache-max-rules 必须大于 0");
+    }
+    if args.cache_max_memos == 0 {
+        bail!("--cache-max-memos 必须大于 0");
+    }
+    if args.max_labels < 2 {
+        bail!("--max-labels 必须大于等于 2");
+    }
+    if args.gmail_batch_size == 0 {
+        bail!("--gmail-batch-size 必须大于 0");
+    }
+    if args.gmail_batch_retry_backoff_secs == 0 {
+        bail!("--gmail-batch-retry-backoff-secs 必须大于 0");
+    }
+    if args.feedback_bad_threshold == 0 {
+        bail!("--feedback-bad-threshold 必须大于 0");
+    }
+    if args.feedback_hit_penalty < 0 {
+        bail!("--feedback-hit-penalty 不能小于 0");
+    }
+    if args.feedback_max_age_hours <= 0 {
+        bail!("--feedback-max-age-hours 必须大于 0");
+    }
+    Ok(())
+}
+
+pub(crate) fn build_gog_setup_error(raw_error: &str, account: &Option<String>) -> AppError {
+    let account_hint = account
+        .as_ref()
+        .map(|a| format!("当前传入账号: `{a}`\n"))
+        .unwrap_or_default();
+    AppError::Config(format!(
+        "gog 配置检查失败。\n\
+         原始错误: {raw_error}\n\n\
+         排查建议:\n\
+         1. 确认已安装 gog，并可执行 `gog --help`\n\
+         2. 执行 `gog auth login` 完成登录\n\
+         3. 执行 `gog auth status` 检查认证状态\n\
+         4. 执行 `gog gmail labels list --no-input --json` 验证 Gmail 访问\n\
+         {account_hint}\
+         5. 如使用多账号，运行时加 `--account <name>` 指定账号"
+    ))
+}
+
+pub(crate) fn build_codex_setup_error(raw_error: &str, codex_cmd: &str) -> AppError {
+    AppError::Config(format!(
+        "Codex 配置检查失败。\n\
+         原始错误: {raw_error}\n\
+         当前 --codex-cmd: `{codex_cmd}`\n\n\
+         排查建议:\n\
+         1. 确认可执行 `codex --help` 或你自定义命令的 `--help`\n\
+         2. 若命令不存在，安装/修正 PATH，或通过 `--codex-cmd` 指定正确命令\n\
+         3. 如需登录，先执行对应登录步骤后再运行本工具"
+    ))
+}
+
+pub(crate) fn run() -> Result<()> {
+    let args = Args::parse();
+    validate_args(&args)?;
+
+    let effective_workers = if args.codex_workers == 0 {
+        auto_codex_workers(args.limit)
+    } else {
+        args.codex_workers
+    };
+    log(&format!(
+        "Codex 并发设置: {}（用户输入: {}）",
+        effective_workers, args.codex_workers
+    ));
+    let mut codex_pool: Option<ThreadPool> = None;
+    let mut codex_checked = false;
+    log("冷启动优化: 已启用 Codex 预检与线程池懒加载（仅在缓存未命中时触发）");
+    let baseline_write_options = GmailWriteOptions {
+        batch_size: args.gmail_batch_size,
+        batch_retries: args.gmail_batch_retries,
+        batch_retry_backoff_secs: args.gmail_batch_retry_backoff_secs,
+    };
+    let mut write_tuner = AdaptiveWriteTuner::new(baseline_write_options);
+
+    let mut cache = load_cache(&args.cache_file);
+    prune_cache(
+        &mut cache,
+        args.cache_max_rules,
+        args.cache_max_memos,
+        args.cache_ttl_hours,
+    );
+    let mut last_saved_fingerprint = cache_fingerprint(&cache)?;
+
+    let mut existing_labels = fetch_existing_labels(&args.account)
+        .map_err(|e| build_gog_setup_error(&e.to_string(), &args.account))?;
+
+    loop {
+        let feedback_summary = apply_feedback_from_file(
+            &mut cache,
+            &args.feedback_file,
+            args.feedback_bad_threshold,
+            args.feedback_hit_penalty,
+            args.feedback_max_age_hours,
+        )?;
+        if feedback_summary.applied_events > 0 {
+            log(&format!(
+                "FEEDBACK_APPLIED: events={} skipped={} affected_rules={} dropped_rules={}",
+                feedback_summary.applied_events,
+                feedback_summary.skipped_events,
+                feedback_summary.affected_rules,
+                feedback_summary.dropped_rules
+            ));
+        }
+
+        let round_started = Instant::now();
+        let (state, metrics) = match process_once_with_deps(
+            &RealDeps,
+            &args,
+            &mut cache,
+            &mut existing_labels,
+            effective_workers,
+            &mut codex_pool,
+            &mut codex_checked,
+            write_tuner.current,
+        ) {
+            Ok(v) => v,
+            Err(e) => match e {
+                AppError::RateLimit(msg) => {
+                    log(&format!("RATE_LIMIT: 本轮跳过，等待下轮。详情: {}", msg));
+                    write_tuner.on_rate_limit();
+                    log(&format!(
+                        "ADAPTIVE_TUNING: 限流后调整写入参数 batch_size={} retries={} backoff_secs={}",
+                        write_tuner.current.batch_size,
+                        write_tuner.current.batch_retries,
+                        write_tuner.current.batch_retry_backoff_secs
+                    ));
+                    ("rate_limit".to_string(), RoundMetrics::default())
+                }
+                AppError::Config(msg) => {
+                    return Err(anyhow!(msg));
+                }
+                other => {
+                    log(&format!("ERROR: {}", other));
+                    ("error".to_string(), RoundMetrics::default())
+                }
+            },
+        };
+        if state == "processed" {
+            write_tuner.on_success();
+            log(&format!(
+                "ROUND_METRICS: total={} cache_hits={} codex_jobs={} codex_success={} codex_failures={} elapsed_ms={}",
+                metrics.total_threads,
+                metrics.cache_hits,
+                metrics.codex_jobs,
+                metrics.codex_success,
+                metrics.codex_failures,
+                round_started.elapsed().as_millis()
+            ));
+            log(&format!(
+                "ADAPTIVE_TUNING: 当前写入参数 batch_size={} retries={} backoff_secs={}",
+                write_tuner.current.batch_size,
+                write_tuner.current.batch_retries,
+                write_tuner.current.batch_retry_backoff_secs
+            ));
+        }
+
+        prune_cache(
+            &mut cache,
+            args.cache_max_rules,
+            args.cache_max_memos,
+            args.cache_ttl_hours,
+        );
+        let current_fingerprint = cache_fingerprint(&cache)?;
+        if current_fingerprint != last_saved_fingerprint {
+            save_cache(&args.cache_file, &cache)?;
+            last_saved_fingerprint = current_fingerprint;
+        }
+
+        if !args.r#loop || state == "done" {
+            break;
+        }
+
+        log(&format!("休眠 {} 秒后继续...", args.interval));
+        thread::sleep(Duration::from_secs(args.interval));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::classify::{codex_error_hint, rule_matches};
+    use crate::models::{
+        DEFAULT_CACHE_FILE, DEFAULT_CACHE_MAX_MEMOS, DEFAULT_CACHE_MAX_RULES,
+        DEFAULT_CACHE_TTL_HOURS, DEFAULT_CODEX_WORKERS, DEFAULT_FEEDBACK_BAD_THRESHOLD,
+        DEFAULT_FEEDBACK_FILE, DEFAULT_FEEDBACK_HIT_PENALTY, DEFAULT_FEEDBACK_MAX_AGE_HOURS,
+        DEFAULT_GMAIL_BATCH_RETRIES, DEFAULT_GMAIL_BATCH_RETRY_BACKOFF_SECS,
+        DEFAULT_GMAIL_BATCH_SIZE, DEFAULT_MAX_ACTIVE_LABELS, DEFAULT_MERGED_LABEL, Rule, RuleInput,
+    };
+    use crate::utils::normalize_label;
+
+    struct MockDeps {
+        pending: Vec<ThreadInfo>,
+        codex_result: CodexClassify,
+        applied: Mutex<Vec<HashMap<String, Vec<String>>>>,
+        archived: Mutex<Vec<Vec<String>>>,
+        codex_calls: Mutex<usize>,
+        codex_ready_calls: Mutex<usize>,
+    }
+
+    impl AppDeps for MockDeps {
+        fn fetch_pending(
+            &self,
+            _limit: usize,
+            _account: &Option<String>,
+        ) -> std::result::Result<Vec<ThreadInfo>, DynErr> {
+            Ok(self.pending.clone())
+        }
+
+        fn ensure_label(
+            &self,
+            label: &str,
+            existing_labels: &mut HashSet<String>,
+            _account: &Option<String>,
+            _dry_run: bool,
+        ) -> std::result::Result<(), DynErr> {
+            existing_labels.insert(label.to_string());
+            Ok(())
+        }
+
+        fn codex_analyze_email(
+            &self,
+            _sender: &str,
+            _subject: &str,
+            _snippet: &str,
+            _codex_cmd: &str,
+        ) -> CodexClassify {
+            let mut calls = self.codex_calls.lock().expect("lock poisoned");
+            *calls += 1;
+            self.codex_result.clone()
+        }
+
+        fn ensure_codex_ready(&self, _codex_cmd: &str) -> std::result::Result<(), DynErr> {
+            let mut calls = self.codex_ready_calls.lock().expect("lock poisoned");
+            *calls += 1;
+            Ok(())
+        }
+
+        fn apply_labels(
+            &self,
+            grouped: &HashMap<String, Vec<String>>,
+            _account: &Option<String>,
+            _dry_run: bool,
+            _write_options: GmailWriteOptions,
+        ) -> std::result::Result<(), DynErr> {
+            self.applied
+                .lock()
+                .expect("lock poisoned")
+                .push(grouped.clone());
+            Ok(())
+        }
+
+        fn archive_threads(
+            &self,
+            thread_ids: &[String],
+            _account: &Option<String>,
+            _dry_run: bool,
+            _write_options: GmailWriteOptions,
+        ) -> std::result::Result<(), DynErr> {
+            self.archived
+                .lock()
+                .expect("lock poisoned")
+                .push(thread_ids.to_vec());
+            Ok(())
+        }
+    }
+
+    fn make_args() -> Args {
+        Args {
+            limit: 20,
+            interval: 300,
+            r#loop: false,
+            account: None,
+            dry_run: false,
+            codex_cmd: "codex exec".to_string(),
+            cache_file: DEFAULT_CACHE_FILE.to_string(),
+            cache_ttl_hours: DEFAULT_CACHE_TTL_HOURS,
+            cache_max_rules: DEFAULT_CACHE_MAX_RULES,
+            cache_max_memos: DEFAULT_CACHE_MAX_MEMOS,
+            max_labels: DEFAULT_MAX_ACTIVE_LABELS,
+            merged_label: DEFAULT_MERGED_LABEL.to_string(),
+            codex_workers: DEFAULT_CODEX_WORKERS,
+            keep_inbox: false,
+            gmail_batch_size: DEFAULT_GMAIL_BATCH_SIZE,
+            gmail_batch_retries: DEFAULT_GMAIL_BATCH_RETRIES,
+            gmail_batch_retry_backoff_secs: DEFAULT_GMAIL_BATCH_RETRY_BACKOFF_SECS,
+            feedback_file: DEFAULT_FEEDBACK_FILE.to_string(),
+            feedback_bad_threshold: DEFAULT_FEEDBACK_BAD_THRESHOLD,
+            feedback_hit_penalty: DEFAULT_FEEDBACK_HIT_PENALTY,
+            feedback_max_age_hours: DEFAULT_FEEDBACK_MAX_AGE_HOURS,
+        }
+    }
+
+    #[test]
+    fn test_normalize_label() {
+        assert_eq!(normalize_label("  账单   通知 "), "账单 通知");
+        assert_eq!(normalize_label(""), "待分类");
+    }
+
+    #[test]
+    fn test_rule_matches() {
+        let rule = Rule {
+            include_keywords: vec!["invoice".to_string()],
+            exclude_keywords: vec!["spam".to_string()],
+            ..Default::default()
+        };
+        assert!(rule_matches(&rule, "sender", "invoice arrived", "body"));
+        assert!(!rule_matches(&rule, "sender", "hello", "body"));
+        assert!(!rule_matches(&rule, "sender", "invoice", "spam body"));
+    }
+
+    #[test]
+    fn test_alias_resolve_chain() {
+        let mut cache = CacheData::default();
+        cache.label_aliases.insert("A".to_string(), "B".to_string());
+        cache.label_aliases.insert("B".to_string(), "C".to_string());
+        assert_eq!(resolve_label_alias("A", &cache), "C");
+    }
+
+    #[test]
+    fn test_gog_setup_error_contains_fix_steps() {
+        let err = build_gog_setup_error("mock error", &Some("work".to_string())).to_string();
+        assert!(err.contains("gog 配置检查失败"));
+        assert!(err.contains("gog auth login"));
+        assert!(err.contains("--account <name>"));
+    }
+
+    #[test]
+    fn test_codex_setup_error_contains_fix_steps() {
+        let err = build_codex_setup_error("not found", "codex exec").to_string();
+        assert!(err.contains("Codex 配置检查失败"));
+        assert!(err.contains("codex --help"));
+        assert!(err.contains("--codex-cmd"));
+    }
+
+    #[test]
+    fn test_codex_error_hint_for_not_found() {
+        let hint = codex_error_hint("codex_not_found").unwrap_or("");
+        assert!(hint.contains("--codex-cmd"));
+    }
+
+    #[test]
+    fn test_process_once_with_deps_no_external_commands() {
+        let deps = MockDeps {
+            pending: vec![ThreadInfo {
+                id: "t1".to_string(),
+                sender: "billing@example.com".to_string(),
+                subject: "monthly invoice".to_string(),
+                snippet: "invoice attached".to_string(),
+            }],
+            codex_result: CodexClassify {
+                ok: true,
+                label: "账单".to_string(),
+                summary: "账单邮件".to_string(),
+                rule: RuleInput {
+                    description: "账单".to_string(),
+                    include_keywords: vec!["invoice".to_string()],
+                    exclude_keywords: vec![],
+                },
+            },
+            applied: Mutex::new(Vec::new()),
+            archived: Mutex::new(Vec::new()),
+            codex_calls: Mutex::new(0),
+            codex_ready_calls: Mutex::new(0),
+        };
+        let args = make_args();
+        let mut cache = CacheData::default();
+        let mut existing_labels = HashSet::new();
+
+        let mut codex_pool: Option<ThreadPool> = None;
+        let mut codex_checked = false;
+        let (state, metrics) = process_once_with_deps(
+            &deps,
+            &args,
+            &mut cache,
+            &mut existing_labels,
+            1,
+            &mut codex_pool,
+            &mut codex_checked,
+            GmailWriteOptions {
+                batch_size: args.gmail_batch_size,
+                batch_retries: args.gmail_batch_retries,
+                batch_retry_backoff_secs: args.gmail_batch_retry_backoff_secs,
+            },
+        )
+        .expect("process_once should succeed");
+        assert_eq!(state, "processed");
+        assert_eq!(metrics.total_threads, 1);
+        assert_eq!(metrics.codex_jobs, 1);
+        assert_eq!(metrics.codex_success, 1);
+
+        let applied = deps.applied.lock().expect("lock poisoned");
+        assert_eq!(applied.len(), 1);
+        let grouped = &applied[0];
+        let ids = grouped.get("账单").expect("expected 账单 label");
+        assert_eq!(ids, &vec!["t1".to_string()]);
+
+        let archived = deps.archived.lock().expect("lock poisoned");
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0], vec!["t1".to_string()]);
+        assert_eq!(*deps.codex_calls.lock().expect("lock poisoned"), 1);
+        assert_eq!(*deps.codex_ready_calls.lock().expect("lock poisoned"), 1);
+    }
+
+    #[test]
+    fn test_adaptive_write_tuner_tightens_and_recovers() {
+        let base = GmailWriteOptions {
+            batch_size: 100,
+            batch_retries: 2,
+            batch_retry_backoff_secs: 1,
+        };
+        let mut tuner = AdaptiveWriteTuner::new(base);
+
+        tuner.on_rate_limit();
+        assert_eq!(tuner.current.batch_size, 50);
+        assert_eq!(tuner.current.batch_retries, 3);
+        assert_eq!(tuner.current.batch_retry_backoff_secs, 2);
+
+        tuner.on_success();
+        tuner.on_success();
+        tuner.on_success();
+        assert_eq!(tuner.current.batch_size, 60);
+        assert_eq!(tuner.current.batch_retries, 2);
+        assert_eq!(tuner.current.batch_retry_backoff_secs, 1);
+    }
+
+    #[test]
+    fn test_e2e_cache_hit_path_skips_codex() {
+        let mut cache = CacheData::default();
+        cache.rules.push(Rule {
+            id: "r-cache".to_string(),
+            label: "账单".to_string(),
+            include_keywords: vec!["invoice".to_string()],
+            hits: 3,
+            ..Default::default()
+        });
+        let deps = MockDeps {
+            pending: vec![ThreadInfo {
+                id: "t-cache".to_string(),
+                sender: "billing@example.com".to_string(),
+                subject: "invoice ready".to_string(),
+                snippet: "monthly invoice".to_string(),
+            }],
+            codex_result: CodexClassify {
+                ok: true,
+                label: "不应触发".to_string(),
+                summary: "unused".to_string(),
+                rule: RuleInput::default(),
+            },
+            applied: Mutex::new(Vec::new()),
+            archived: Mutex::new(Vec::new()),
+            codex_calls: Mutex::new(0),
+            codex_ready_calls: Mutex::new(0),
+        };
+        let args = make_args();
+        let mut existing_labels = HashSet::new();
+        let mut codex_pool: Option<ThreadPool> = None;
+        let mut codex_checked = false;
+
+        let (state, metrics) = process_once_with_deps(
+            &deps,
+            &args,
+            &mut cache,
+            &mut existing_labels,
+            1,
+            &mut codex_pool,
+            &mut codex_checked,
+            GmailWriteOptions {
+                batch_size: args.gmail_batch_size,
+                batch_retries: args.gmail_batch_retries,
+                batch_retry_backoff_secs: args.gmail_batch_retry_backoff_secs,
+            },
+        )
+        .expect("process_once should succeed");
+
+        assert_eq!(state, "processed");
+        assert_eq!(metrics.cache_hits, 1);
+        assert_eq!(metrics.codex_jobs, 0);
+        assert_eq!(*deps.codex_calls.lock().expect("lock poisoned"), 0);
+        assert_eq!(*deps.codex_ready_calls.lock().expect("lock poisoned"), 0);
+    }
+
+    #[test]
+    fn test_e2e_codex_failure_skips_writes() {
+        let deps = MockDeps {
+            pending: vec![ThreadInfo {
+                id: "t-fail".to_string(),
+                sender: "x@example.com".to_string(),
+                subject: "unknown".to_string(),
+                snippet: "unknown".to_string(),
+            }],
+            codex_result: CodexClassify {
+                ok: false,
+                label: "待分类".to_string(),
+                summary: "codex_timeout".to_string(),
+                rule: RuleInput::default(),
+            },
+            applied: Mutex::new(Vec::new()),
+            archived: Mutex::new(Vec::new()),
+            codex_calls: Mutex::new(0),
+            codex_ready_calls: Mutex::new(0),
+        };
+        let args = make_args();
+        let mut cache = CacheData::default();
+        let mut existing_labels = HashSet::new();
+        let mut codex_pool: Option<ThreadPool> = None;
+        let mut codex_checked = false;
+
+        let (state, metrics) = process_once_with_deps(
+            &deps,
+            &args,
+            &mut cache,
+            &mut existing_labels,
+            1,
+            &mut codex_pool,
+            &mut codex_checked,
+            GmailWriteOptions {
+                batch_size: args.gmail_batch_size,
+                batch_retries: args.gmail_batch_retries,
+                batch_retry_backoff_secs: args.gmail_batch_retry_backoff_secs,
+            },
+        )
+        .expect("process_once should succeed");
+
+        assert_eq!(state, "processed");
+        assert_eq!(metrics.codex_jobs, 1);
+        assert_eq!(metrics.codex_failures, 1);
+        assert_eq!(*deps.codex_calls.lock().expect("lock poisoned"), 1);
+        assert_eq!(*deps.codex_ready_calls.lock().expect("lock poisoned"), 1);
+    }
+}

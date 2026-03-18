@@ -1,9 +1,14 @@
 # gmail-auto-label (Rust)
 
+[![Documentation](https://docs.rs/gmail-auto-label/badge.svg)](https://docs.rs/gmail-auto-label)
+[![License](https://img.shields.io/crates/l/gmail-auto-label.svg)](https://crates.io/crates/gmail-auto-label)
+[![Crates.io](https://img.shields.io/crates/v/gmail-auto-label.svg)](https://crates.io/crates/gmail-auto-label)
+[![Crates.io](https://img.shields.io/crates/d/gmail-auto-label.svg)](https://crates.io/crates/gmail-auto-label)
+
 基于 `gog` + `codex` 的 Gmail 自动分类打标工具（Rust 版）。  
 这是中文文档。
 
-English version: [README.md](README.md)
+🌐 Languages: [🇺🇸 English](README.md) · [🇨🇳 简体中文](README_ZH.md)
 
 ## 功能描述
 
@@ -138,6 +143,30 @@ cargo run -- --keep-inbox
 - `--merged-label`：标签超限时合并目标，默认 `其他通知`
 - `--codex-workers`：Codex 并发数，`0` 表示自动
 - `--keep-inbox`：处理后不移出收件箱
+- `--gmail-batch-size`：Gmail 写入分批大小，默认 `100`
+- `--gmail-batch-retries`：每个分批写入失败后的重试次数，默认 `2`
+- `--gmail-batch-retry-backoff-secs`：分批重试退避秒数，默认 `1`
+- `--feedback-file`：反馈文件路径，默认 `/tmp/gmail_auto_label_feedback.json`
+- `--feedback-bad-threshold`：规则 bad 反馈累计达到该阈值时淘汰，默认 `3`
+- `--feedback-hit-penalty`：每条 bad 反馈扣减规则命中分值，默认 `2`
+- `--feedback-max-age-hours`：可接受反馈事件的最大时效（小时），默认 `336`
+
+反馈文件格式（`--feedback-file`）：
+
+```json
+[
+  {
+    "event_id": "evt-20260318-001",
+    "rule_id": "rule_sha256_id",
+    "verdict": "bad",
+    "ts": 1773800000
+  }
+]
+```
+
+说明：
+- `event_id` 需唯一，重复/回放事件会被跳过。
+- `ts` 为 Unix 秒时间戳，超过 `--feedback-max-age-hours` 的过期事件会被跳过。
 
 ## 查看帮助
 
