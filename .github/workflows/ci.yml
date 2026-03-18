@@ -1,0 +1,169 @@
+name: CI
+
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --all-targets --all-features
+
+      - name: Doc tests
+        run: cargo test --doc
+
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cargo audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  notify:
+    name: Notify Failure
+    runs-on: ubuntu-latest
+    needs: [quality, security]
+    if: ${{ always() }}
+    env:
+      TARGET_PR_AUTHOR: lichtcui
+
+    steps:
+      - name: Prepare notification metadata
+        id: meta
+        uses: actions/github-script@v7
+        env:
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          SECURITY_RESULT: ${{ needs.security.result }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const qualityResult = process.env.QUALITY_RESULT;
+            const securityResult = process.env.SECURITY_RESULT;
+            const ordered = [qualityResult, securityResult];
+            let conclusion = 'success';
+            if (ordered.includes('failure')) conclusion = 'failure';
+            else if (ordered.includes('cancelled')) conclusion = 'cancelled';
+            else if (ordered.includes('timed_out')) conclusion = 'timed_out';
+            else if (ordered.includes('skipped')) conclusion = 'skipped';
+
+            const isPR = context.eventName === 'pull_request';
+            const pr = context.payload.pull_request;
+            const targetAuthor = process.env.TARGET_PR_AUTHOR;
+            const prAuthor = isPR ? pr?.user?.login || '' : context.actor;
+            const matchesAuthor = !isPR || prAuthor === targetAuthor;
+            const shouldNotify = matchesAuthor && conclusion === 'failure';
+
+            core.setOutput('should_notify', shouldNotify ? 'true' : 'false');
+            core.setOutput('conclusion', conclusion);
+            core.setOutput('quality_result', qualityResult);
+            core.setOutput('security_result', securityResult);
+            core.setOutput('pr_number', isPR ? String(pr.number) : 'N/A');
+            core.setOutput('pr_title', isPR ? pr.title : (context.eventName === 'push' ? 'Push workflow run' : 'Manual workflow run'));
+            core.setOutput('pr_url', isPR ? pr.html_url : `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`);
+            core.setOutput('pr_author', prAuthor);
+            core.setOutput('head_ref', isPR ? pr.head.ref : (context.ref || '').replace('refs/heads/', ''));
+            core.setOutput('base_ref', isPR ? pr.base.ref : 'N/A');
+            core.setOutput('actions_url', `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`);
+
+      - name: Warn when Gmail secrets are missing
+        if: ${{ steps.meta.outputs.should_notify == 'true' }}
+        env:
+          GMAIL_USERNAME: ${{ secrets.LICHT_GMAIL_USERNAME }}
+          GMAIL_APP_PASSWORD: ${{ secrets.LICHT_GMAIL_APP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.LICHT_ALERT_EMAIL_TO }}
+        run: |
+          missing=""
+          [ -z "$GMAIL_USERNAME" ] && missing="$missing LICHT_GMAIL_USERNAME"
+          [ -z "$GMAIL_APP_PASSWORD" ] && missing="$missing LICHT_GMAIL_APP_PASSWORD"
+          [ -z "$ALERT_EMAIL_TO" ] && missing="$missing LICHT_ALERT_EMAIL_TO"
+          if [ -n "$missing" ]; then
+            echo "::warning title=Gmail alert skipped::Missing required secrets:$missing"
+          fi
+
+      - name: Validate Gmail credentials format
+        id: validate_gmail
+        if: ${{ steps.meta.outputs.should_notify == 'true' }}
+        env:
+          GMAIL_USERNAME: ${{ secrets.LICHT_GMAIL_USERNAME }}
+          GMAIL_APP_PASSWORD: ${{ secrets.LICHT_GMAIL_APP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.LICHT_ALERT_EMAIL_TO }}
+        run: |
+          valid="true"
+          if [ -z "$GMAIL_USERNAME" ] || [ -z "$GMAIL_APP_PASSWORD" ] || [ -z "$ALERT_EMAIL_TO" ]; then
+            valid="false"
+          fi
+          if [ "$valid" = "true" ] && ! printf '%s' "$GMAIL_USERNAME" | grep -Eq '^[^[:space:]@]+@gmail\.com$'; then
+            echo "::warning title=Invalid LICHT_GMAIL_USERNAME::Use full Gmail address like xxx@gmail.com"
+            valid="false"
+          fi
+          if [ "$valid" = "true" ] && printf '%s' "$GMAIL_APP_PASSWORD" | grep -q '[[:space:]]'; then
+            echo "::warning title=Invalid LICHT_GMAIL_APP_PASSWORD::App password must not contain spaces"
+            valid="false"
+          fi
+          if [ "$valid" = "true" ] && [ "${#GMAIL_APP_PASSWORD}" -ne 16 ]; then
+            echo "::warning title=Invalid LICHT_GMAIL_APP_PASSWORD::Expected 16 characters app password"
+            valid="false"
+          fi
+          echo "credentials_valid=$valid" >> "$GITHUB_OUTPUT"
+
+      - name: Send Gmail notification
+        if: ${{ steps.meta.outputs.should_notify == 'true' && steps.validate_gmail.outputs.credentials_valid == 'true' && env.GMAIL_USERNAME != '' && env.GMAIL_APP_PASSWORD != '' && env.ALERT_EMAIL_TO != '' }}
+        env:
+          GMAIL_USERNAME: ${{ secrets.LICHT_GMAIL_USERNAME }}
+          GMAIL_APP_PASSWORD: ${{ secrets.LICHT_GMAIL_APP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.LICHT_ALERT_EMAIL_TO }}
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ env.GMAIL_USERNAME }}
+          password: ${{ env.GMAIL_APP_PASSWORD }}
+          subject: >-
+            [CI ${{ steps.meta.outputs.conclusion }}] PR #${{ steps.meta.outputs.pr_number }} - ${{ steps.meta.outputs.pr_title }}
+          to: ${{ env.ALERT_EMAIL_TO }}
+          from: GitHub Actions <${{ env.GMAIL_USERNAME }}>
+          html_body: |
+            <h3>CI Failure Alert</h3>
+            <p><b>Repository</b>: ${{ github.repository }}</p>
+            <p><b>Workflow</b>: ${{ github.workflow }}</p>
+            <p><b>Conclusion</b>: ${{ steps.meta.outputs.conclusion }}</p>
+            <p><b>quality</b>: ${{ steps.meta.outputs.quality_result }}</p>
+            <p><b>security</b>: ${{ steps.meta.outputs.security_result }}</p>
+            <p><b>Run Number</b>: ${{ github.run_number }}</p>
+            <p><b>PR</b>: #${{ steps.meta.outputs.pr_number }} ${{ steps.meta.outputs.pr_title }}</p>
+            <p><b>PR Author</b>: ${{ steps.meta.outputs.pr_author }}</p>
+            <p><b>Branch</b>: ${{ steps.meta.outputs.head_ref }} -> ${{ steps.meta.outputs.base_ref }}</p>
+            <p><b>Triggered By</b>: ${{ github.actor }}</p>
+            <p><a href="${{ steps.meta.outputs.pr_url }}">View PR</a></p>
+            <p><a href="${{ steps.meta.outputs.actions_url }}">View Workflow Run</a></p>
