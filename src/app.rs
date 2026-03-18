@@ -171,6 +171,7 @@ impl AppDeps for RealDeps {
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn collect_threads<D: AppDeps>(
     deps: &D,
     args: &Args,
@@ -221,6 +222,7 @@ fn collect_threads<D: AppDeps>(
     Ok((grouped, processed_ids, codex_jobs, metrics))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_codex_for_jobs<D: AppDeps>(
     deps: &D,
     args: &Args,
@@ -312,9 +314,10 @@ fn run_codex_for_jobs<D: AppDeps>(
     }
 
     if total_results > 0 && codex_setup_failures == total_results {
-        return Err(AppError::Config(format!(
+        return Err(AppError::Config(
             "Codex 配置不可用：本轮所有未命中缓存邮件都因 codex 配置问题失败。请先修复 codex 后重试。"
-        )));
+                .to_string(),
+        ));
     }
 
     Ok((codex_success, codex_failures))
@@ -335,6 +338,7 @@ fn regroup_by_alias(
     regrouped
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_once_with_deps<D: AppDeps>(
     deps: &D,
     args: &Args,

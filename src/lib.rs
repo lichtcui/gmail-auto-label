@@ -20,9 +20,7 @@ mod utils;
 /// # Examples
 ///
 /// ```no_run
-/// fn main() {
-///     gmail_auto_label::main_entry();
-/// }
+/// gmail_auto_label::main_entry();
 /// ```
 pub fn main_entry() {
     if let Err(e) = app::run() {
