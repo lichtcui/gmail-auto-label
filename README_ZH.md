@@ -17,7 +17,7 @@
 - 缓存未命中时调用 Codex 分类，并把规则回写到本地缓存
 - 自动创建缺失标签，并按标签批量回写邮件线程
 - 支持打标后自动归档（移出 `INBOX`），也可用 `--keep-inbox` 保留收件箱
-- 活跃标签超限时自动压缩合并（`--max-labels` + `--merged-label`）
+- 活跃标签超限时自动压缩合并（公开参数为 `--max-labels`，默认合并到 `其他通知`）
 - 内置 Gmail 限流处理（自动重试 + 指数退避）
 - 支持 `--dry-run` 演练模式，预览动作但不写入
 
@@ -116,10 +116,10 @@ cargo run -- --limit 20
 cargo run -- --dry-run --limit 20
 ```
 
-3. 循环模式（每 5 分钟一轮）：
+3. 轮询模式（每 5 分钟一轮）：
 
 ```bash
-cargo run -- --loop --interval 300
+cargo run -- --watch 300
 ```
 
 4. 仅打标签，不归档（保留收件箱）：
@@ -131,27 +131,22 @@ cargo run -- --keep-inbox
 ## 关键参数
 
 - `--limit`：每轮最多处理数量，默认 `20`
-- `--loop`：持续循环直到没有待处理邮件
-- `--interval`：循环间隔秒数，默认 `300`
+- `--watch`：按秒轮询，例如 `--watch 300`
+- `--account`：指定 gog 账号名
 - `--dry-run`：只打印操作，不执行写入
-- `--codex-cmd`：自定义 Codex 命令前缀，默认 `"codex exec"`
-- `--cache-file`：缓存文件路径，默认 `/tmp/gmail_auto_label_codex_cache.json`
-- `--cache-ttl-hours`：缓存有效期（小时），默认 `336`
-- `--cache-max-rules`：缓存规则上限，默认 `500`
-- `--cache-max-memos`：缓存记忆上限，默认 `5000`
 - `--max-labels`：最大活跃标签数，默认 `10`
-- `--merged-label`：标签超限时合并目标，默认 `其他通知`
-- `--codex-workers`：Codex 并发数，`0` 表示自动
 - `--keep-inbox`：处理后不移出收件箱
-- `--gmail-batch-size`：Gmail 写入分批大小，默认 `100`
-- `--gmail-batch-retries`：每个分批写入失败后的重试次数，默认 `2`
-- `--gmail-batch-retry-backoff-secs`：分批重试退避秒数，默认 `1`
-- `--feedback-file`：反馈文件路径，默认 `/tmp/gmail_auto_label_feedback.json`
-- `--feedback-bad-threshold`：规则 bad 反馈累计达到该阈值时淘汰，默认 `3`
-- `--feedback-hit-penalty`：每条 bad 反馈扣减规则命中分值，默认 `2`
-- `--feedback-max-age-hours`：可接受反馈事件的最大时效（小时），默认 `336`
 
-反馈文件格式（`--feedback-file`）：
+## 高级参数
+
+这些参数仍兼容保留，但默认隐藏，一般不需要手动设置：
+
+- `--codex-cmd`
+- `--cache-file`
+- `--merged-label`
+- 旧版兼容：`--loop` + `--interval` 仍可用，但推荐统一改成 `--watch`
+
+内置反馈文件格式（内部路径固定为 `/tmp/gmail_auto_label_feedback.json`）：
 
 ```json
 [
@@ -166,7 +161,7 @@ cargo run -- --keep-inbox
 
 说明：
 - `event_id` 需唯一，重复/回放事件会被跳过。
-- `ts` 为 Unix 秒时间戳，超过 `--feedback-max-age-hours` 的过期事件会被跳过。
+- `ts` 为 Unix 秒时间戳，超过内置反馈时效的过期事件会被跳过。
 
 ## 查看帮助
 

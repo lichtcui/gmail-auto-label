@@ -17,7 +17,7 @@ This is the primary documentation.
 - Codex fallback for uncached emails, then persist extracted rules for later reuse
 - Auto-create missing Gmail labels and apply labels in batches
 - Optional archive step (remove `INBOX`) after labeling, with `--keep-inbox` support
-- Label compression when active labels exceed limit (`--max-labels` + `--merged-label`)
+- Label compression when active labels exceed the limit (public control is `--max-labels`, merge target defaults to `其他通知`)
 - Gmail rate-limit handling with automatic retry and exponential backoff
 - Dry-run mode for safe preview without write operations
 
@@ -116,10 +116,10 @@ cargo run -- --limit 20
 cargo run -- --dry-run --limit 20
 ```
 
-3. Loop mode (every 5 minutes):
+3. Watch mode (every 5 minutes):
 
 ```bash
-cargo run -- --loop --interval 300
+cargo run -- --watch 300
 ```
 
 4. Keep messages in inbox (label only, no archive):
@@ -131,27 +131,22 @@ cargo run -- --keep-inbox
 ## Key Options
 
 - `--limit`: max threads per run, default `20`
-- `--loop`: keep running until no pending threads
-- `--interval`: loop sleep seconds, default `300`
+- `--watch`: polling interval in seconds, for example `--watch 300`
+- `--account`: gog account name
 - `--dry-run`: print actions only, no writes
-- `--codex-cmd`: custom Codex command prefix, default `"codex exec"`
-- `--cache-file`: cache file path, default `/tmp/gmail_auto_label_codex_cache.json`
-- `--cache-ttl-hours`: cache TTL in hours, default `336`
-- `--cache-max-rules`: max cached rules, default `500`
-- `--cache-max-memos`: max cached memos, default `5000`
 - `--max-labels`: max active labels, default `10`
-- `--merged-label`: merge target when labels exceed limit, default `其他通知`
-- `--codex-workers`: Codex concurrency, `0` means auto
 - `--keep-inbox`: do not remove processed threads from inbox
-- `--gmail-batch-size`: Gmail modify batch size, default `100`
-- `--gmail-batch-retries`: retries per Gmail write batch, default `2`
-- `--gmail-batch-retry-backoff-secs`: backoff seconds between batch retries, default `1`
-- `--feedback-file`: feedback file path, default `/tmp/gmail_auto_label_feedback.json`
-- `--feedback-bad-threshold`: drop rule when bad feedback count reaches this threshold, default `3`
-- `--feedback-hit-penalty`: reduce rule hits per bad feedback event, default `2`
-- `--feedback-max-age-hours`: max accepted age of feedback events, default `336`
 
-Feedback file format (`--feedback-file`):
+## Advanced Options
+
+These flags remain supported for compatibility, but are hidden by default:
+
+- `--codex-cmd`
+- `--cache-file`
+- `--merged-label`
+- Legacy compatibility: `--loop` + `--interval` still work, but `--watch` is the preferred form
+
+Built-in feedback file format (internal path is fixed to `/tmp/gmail_auto_label_feedback.json`):
 
 ```json
 [
@@ -166,7 +161,7 @@ Feedback file format (`--feedback-file`):
 
 Notes:
 - `event_id` must be unique; duplicated/replayed events are skipped.
-- `ts` uses Unix seconds; stale events older than `--feedback-max-age-hours` are skipped.
+- `ts` uses Unix seconds; stale events older than the built-in feedback retention window are skipped.
 
 ## Help
 

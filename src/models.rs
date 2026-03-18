@@ -8,7 +8,6 @@ pub(crate) const DEFAULT_CACHE_FILE: &str = "/tmp/gmail_auto_label_codex_cache.j
 pub(crate) const DEFAULT_CACHE_TTL_HOURS: i64 = 24 * 14;
 pub(crate) const DEFAULT_CACHE_MAX_RULES: usize = 500;
 pub(crate) const DEFAULT_CACHE_MAX_MEMOS: usize = 5000;
-pub(crate) const DEFAULT_CODEX_WORKERS: usize = 0;
 pub(crate) const DEFAULT_MAX_ACTIVE_LABELS: usize = 10;
 pub(crate) const DEFAULT_MERGED_LABEL: &str = "其他通知";
 pub(crate) const DEFAULT_GMAIL_BATCH_SIZE: usize = 100;
@@ -25,46 +24,33 @@ pub(crate) const DEFAULT_FEEDBACK_MAX_APPLIED_IDS: usize = 10000;
 pub(crate) struct Args {
     #[arg(long, default_value_t = 20)]
     pub(crate) limit: usize,
-    #[arg(long, default_value_t = 300)]
+    #[arg(long, value_name = "SECS")]
+    pub(crate) watch: Option<u64>,
+    #[arg(long, hide = true, default_value_t = 300)]
     pub(crate) interval: u64,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub(crate) r#loop: bool,
     #[arg(long)]
     pub(crate) account: Option<String>,
     #[arg(long)]
     pub(crate) dry_run: bool,
-    #[arg(long, default_value = "codex exec")]
+    #[arg(long, hide = true, default_value = "codex exec")]
     pub(crate) codex_cmd: String,
-    #[arg(long, default_value = DEFAULT_CACHE_FILE)]
+    #[arg(long, hide = true, default_value = DEFAULT_CACHE_FILE)]
     pub(crate) cache_file: String,
-    #[arg(long, default_value_t = DEFAULT_CACHE_TTL_HOURS)]
-    pub(crate) cache_ttl_hours: i64,
-    #[arg(long, default_value_t = DEFAULT_CACHE_MAX_RULES)]
-    pub(crate) cache_max_rules: usize,
-    #[arg(long, default_value_t = DEFAULT_CACHE_MAX_MEMOS)]
-    pub(crate) cache_max_memos: usize,
     #[arg(long, default_value_t = DEFAULT_MAX_ACTIVE_LABELS)]
     pub(crate) max_labels: usize,
-    #[arg(long, default_value = DEFAULT_MERGED_LABEL)]
+    #[arg(long, hide = true, default_value = DEFAULT_MERGED_LABEL)]
     pub(crate) merged_label: String,
-    #[arg(long, default_value_t = DEFAULT_CODEX_WORKERS)]
-    pub(crate) codex_workers: usize,
     #[arg(long)]
     pub(crate) keep_inbox: bool,
-    #[arg(long, default_value_t = DEFAULT_GMAIL_BATCH_SIZE)]
-    pub(crate) gmail_batch_size: usize,
-    #[arg(long, default_value_t = DEFAULT_GMAIL_BATCH_RETRIES)]
-    pub(crate) gmail_batch_retries: u32,
-    #[arg(long, default_value_t = DEFAULT_GMAIL_BATCH_RETRY_BACKOFF_SECS)]
-    pub(crate) gmail_batch_retry_backoff_secs: u64,
-    #[arg(long, default_value = DEFAULT_FEEDBACK_FILE)]
-    pub(crate) feedback_file: String,
-    #[arg(long, default_value_t = DEFAULT_FEEDBACK_BAD_THRESHOLD)]
-    pub(crate) feedback_bad_threshold: u32,
-    #[arg(long, default_value_t = DEFAULT_FEEDBACK_HIT_PENALTY)]
-    pub(crate) feedback_hit_penalty: i64,
-    #[arg(long, default_value_t = DEFAULT_FEEDBACK_MAX_AGE_HOURS)]
-    pub(crate) feedback_max_age_hours: i64,
+}
+
+impl Args {
+    pub(crate) fn watch_interval_secs(&self) -> Option<u64> {
+        self.watch
+            .or(if self.r#loop { Some(self.interval) } else { None })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

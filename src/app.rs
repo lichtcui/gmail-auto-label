@@ -20,7 +20,11 @@ use crate::gog::{
     GmailWriteOptions, apply_labels_with_options, archive_threads_with_options, ensure_label,
     fetch_existing_labels, fetch_pending,
 };
-use crate::models::{Args, CacheData, CodexClassify, ProcessedThread, ThreadInfo};
+use crate::models::{
+    Args, CacheData, CodexClassify, ProcessedThread, ThreadInfo, DEFAULT_CACHE_MAX_MEMOS,
+    DEFAULT_CACHE_MAX_RULES, DEFAULT_CACHE_TTL_HOURS, DEFAULT_FEEDBACK_BAD_THRESHOLD,
+    DEFAULT_FEEDBACK_FILE, DEFAULT_FEEDBACK_HIT_PENALTY, DEFAULT_FEEDBACK_MAX_AGE_HOURS,
+};
 use crate::utils::{auto_codex_workers, log, now_ts, resolve_label_alias};
 
 type DynErr = AppError;
@@ -173,7 +177,6 @@ impl AppDeps for RealDeps {
 
 #[allow(clippy::type_complexity)]
 fn collect_threads(
-    args: &Args,
     cache: &mut CacheData,
     threads: &[ThreadInfo],
 ) -> std::result::Result<
@@ -200,7 +203,7 @@ fn collect_threads(
             &t.subject,
             &t.snippet,
             cache,
-            args.cache_ttl_hours,
+            DEFAULT_CACHE_TTL_HOURS,
             &rule_indexes,
         ) {
             metrics.cache_hits += 1;
@@ -362,7 +365,7 @@ fn filter_recently_processed_keep_inbox_threads(
     }
 
     let now = now_ts();
-    let ttl_seconds = args.cache_ttl_hours * 3600;
+    let ttl_seconds = DEFAULT_CACHE_TTL_HOURS * 3600;
     let mut skipped = 0usize;
     let mut filtered = Vec::with_capacity(threads.len());
 
@@ -444,7 +447,7 @@ fn process_once_with_deps<D: AppDeps>(
     }
 
     let (mut grouped, mut processed_ids, codex_jobs, mut metrics) =
-        collect_threads(args, cache, &threads)?;
+        collect_threads(cache, &threads)?;
     if !codex_jobs.is_empty() && !*codex_checked {
         deps.ensure_codex_ready(&args.codex_cmd)?;
         *codex_checked = true;
@@ -493,35 +496,14 @@ fn validate_args(args: &Args) -> Result<()> {
     if args.limit == 0 {
         bail!("--limit 必须大于 0");
     }
-    if args.interval == 0 {
+    if args.watch == Some(0) {
+        bail!("--watch 必须大于 0");
+    }
+    if args.r#loop && args.interval == 0 {
         bail!("--interval 必须大于 0");
-    }
-    if args.cache_ttl_hours <= 0 {
-        bail!("--cache-ttl-hours 必须大于 0");
-    }
-    if args.cache_max_rules == 0 {
-        bail!("--cache-max-rules 必须大于 0");
-    }
-    if args.cache_max_memos == 0 {
-        bail!("--cache-max-memos 必须大于 0");
     }
     if args.max_labels < 2 {
         bail!("--max-labels 必须大于等于 2");
-    }
-    if args.gmail_batch_size == 0 {
-        bail!("--gmail-batch-size 必须大于 0");
-    }
-    if args.gmail_batch_retry_backoff_secs == 0 {
-        bail!("--gmail-batch-retry-backoff-secs 必须大于 0");
-    }
-    if args.feedback_bad_threshold == 0 {
-        bail!("--feedback-bad-threshold 必须大于 0");
-    }
-    if args.feedback_hit_penalty < 0 {
-        bail!("--feedback-hit-penalty 不能小于 0");
-    }
-    if args.feedback_max_age_hours <= 0 {
-        bail!("--feedback-max-age-hours 必须大于 0");
     }
     Ok(())
 }
@@ -560,31 +542,20 @@ pub(crate) fn run() -> Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
 
-    let effective_workers = if args.codex_workers == 0 {
-        auto_codex_workers(args.limit)
-    } else {
-        args.codex_workers
-    };
-    log(&format!(
-        "Codex 并发设置: {}（用户输入: {}）",
-        effective_workers, args.codex_workers
-    ));
+    let effective_workers = auto_codex_workers(args.limit);
+    log(&format!("Codex 并发设置: {}", effective_workers));
     let mut codex_pool: Option<ThreadPool> = None;
     let mut codex_checked = false;
     log("冷启动优化: 已启用 Codex 预检与线程池懒加载（仅在缓存未命中时触发）");
-    let baseline_write_options = GmailWriteOptions {
-        batch_size: args.gmail_batch_size,
-        batch_retries: args.gmail_batch_retries,
-        batch_retry_backoff_secs: args.gmail_batch_retry_backoff_secs,
-    };
+    let baseline_write_options = GmailWriteOptions::default();
     let mut write_tuner = AdaptiveWriteTuner::new(baseline_write_options);
 
     let mut cache = load_cache(&args.cache_file);
     prune_cache(
         &mut cache,
-        args.cache_max_rules,
-        args.cache_max_memos,
-        args.cache_ttl_hours,
+        DEFAULT_CACHE_MAX_RULES,
+        DEFAULT_CACHE_MAX_MEMOS,
+        DEFAULT_CACHE_TTL_HOURS,
     );
     let mut last_saved_fingerprint = cache_fingerprint(&cache)?;
 
@@ -594,10 +565,10 @@ pub(crate) fn run() -> Result<()> {
     loop {
         let feedback_summary = apply_feedback_from_file(
             &mut cache,
-            &args.feedback_file,
-            args.feedback_bad_threshold,
-            args.feedback_hit_penalty,
-            args.feedback_max_age_hours,
+            DEFAULT_FEEDBACK_FILE,
+            DEFAULT_FEEDBACK_BAD_THRESHOLD,
+            DEFAULT_FEEDBACK_HIT_PENALTY,
+            DEFAULT_FEEDBACK_MAX_AGE_HOURS,
         )?;
         if feedback_summary.total_events > 0 {
             log(&format!(
@@ -664,9 +635,9 @@ pub(crate) fn run() -> Result<()> {
 
         prune_cache(
             &mut cache,
-            args.cache_max_rules,
-            args.cache_max_memos,
-            args.cache_ttl_hours,
+            DEFAULT_CACHE_MAX_RULES,
+            DEFAULT_CACHE_MAX_MEMOS,
+            DEFAULT_CACHE_TTL_HOURS,
         );
         let current_fingerprint = cache_fingerprint(&cache)?;
         if current_fingerprint != last_saved_fingerprint {
@@ -674,12 +645,15 @@ pub(crate) fn run() -> Result<()> {
             last_saved_fingerprint = current_fingerprint;
         }
 
-        if !args.r#loop || state == "done" {
+        let Some(interval_secs) = args.watch_interval_secs() else {
+            break;
+        };
+        if state == "done" {
             break;
         }
 
-        log(&format!("休眠 {} 秒后继续...", args.interval));
-        thread::sleep(Duration::from_secs(args.interval));
+        log(&format!("休眠 {} 秒后继续...", interval_secs));
+        thread::sleep(Duration::from_secs(interval_secs));
     }
 
     Ok(())
@@ -692,13 +666,7 @@ mod tests {
     use super::*;
     use crate::cache::memo_key;
     use crate::classify::{codex_error_hint, rule_matches};
-    use crate::models::{
-        DEFAULT_CACHE_FILE, DEFAULT_CACHE_MAX_MEMOS, DEFAULT_CACHE_MAX_RULES,
-        DEFAULT_CACHE_TTL_HOURS, DEFAULT_CODEX_WORKERS, DEFAULT_FEEDBACK_BAD_THRESHOLD,
-        DEFAULT_FEEDBACK_FILE, DEFAULT_FEEDBACK_HIT_PENALTY, DEFAULT_FEEDBACK_MAX_AGE_HOURS,
-        DEFAULT_GMAIL_BATCH_RETRIES, DEFAULT_GMAIL_BATCH_RETRY_BACKOFF_SECS,
-        DEFAULT_GMAIL_BATCH_SIZE, DEFAULT_MAX_ACTIVE_LABELS, DEFAULT_MERGED_LABEL, Rule, RuleInput,
-    };
+    use crate::models::{DEFAULT_CACHE_FILE, DEFAULT_MAX_ACTIVE_LABELS, DEFAULT_MERGED_LABEL, Rule, RuleInput};
     use crate::utils::{normalize_label, now_ts};
 
     struct MockDeps {
@@ -780,27 +748,21 @@ mod tests {
     fn make_args() -> Args {
         Args {
             limit: 20,
+            watch: None,
             interval: 300,
             r#loop: false,
             account: None,
             dry_run: false,
             codex_cmd: "codex exec".to_string(),
             cache_file: DEFAULT_CACHE_FILE.to_string(),
-            cache_ttl_hours: DEFAULT_CACHE_TTL_HOURS,
-            cache_max_rules: DEFAULT_CACHE_MAX_RULES,
-            cache_max_memos: DEFAULT_CACHE_MAX_MEMOS,
             max_labels: DEFAULT_MAX_ACTIVE_LABELS,
             merged_label: DEFAULT_MERGED_LABEL.to_string(),
-            codex_workers: DEFAULT_CODEX_WORKERS,
             keep_inbox: false,
-            gmail_batch_size: DEFAULT_GMAIL_BATCH_SIZE,
-            gmail_batch_retries: DEFAULT_GMAIL_BATCH_RETRIES,
-            gmail_batch_retry_backoff_secs: DEFAULT_GMAIL_BATCH_RETRY_BACKOFF_SECS,
-            feedback_file: DEFAULT_FEEDBACK_FILE.to_string(),
-            feedback_bad_threshold: DEFAULT_FEEDBACK_BAD_THRESHOLD,
-            feedback_hit_penalty: DEFAULT_FEEDBACK_HIT_PENALTY,
-            feedback_max_age_hours: DEFAULT_FEEDBACK_MAX_AGE_HOURS,
         }
+    }
+
+    fn default_write_options() -> GmailWriteOptions {
+        GmailWriteOptions::default()
     }
 
     #[test]
@@ -889,11 +851,7 @@ mod tests {
             1,
             &mut codex_pool,
             &mut codex_checked,
-            GmailWriteOptions {
-                batch_size: args.gmail_batch_size,
-                batch_retries: args.gmail_batch_retries,
-                batch_retry_backoff_secs: args.gmail_batch_retry_backoff_secs,
-            },
+            default_write_options(),
         )
         .expect("process_once should succeed");
         assert_eq!(state, "processed");
@@ -977,11 +935,7 @@ mod tests {
             1,
             &mut codex_pool,
             &mut codex_checked,
-            GmailWriteOptions {
-                batch_size: args.gmail_batch_size,
-                batch_retries: args.gmail_batch_retries,
-                batch_retry_backoff_secs: args.gmail_batch_retry_backoff_secs,
-            },
+            default_write_options(),
         )
         .expect("process_once should succeed");
 
@@ -1026,11 +980,7 @@ mod tests {
             1,
             &mut codex_pool,
             &mut codex_checked,
-            GmailWriteOptions {
-                batch_size: args.gmail_batch_size,
-                batch_retries: args.gmail_batch_retries,
-                batch_retry_backoff_secs: args.gmail_batch_retry_backoff_secs,
-            },
+            default_write_options(),
         )
         .expect("process_once should succeed");
 
@@ -1099,11 +1049,7 @@ mod tests {
             1,
             &mut codex_pool,
             &mut codex_checked,
-            GmailWriteOptions {
-                batch_size: args.gmail_batch_size,
-                batch_retries: args.gmail_batch_retries,
-                batch_retry_backoff_secs: args.gmail_batch_retry_backoff_secs,
-            },
+            default_write_options(),
         )
         .expect("process_once should succeed");
 
@@ -1170,11 +1116,7 @@ mod tests {
             1,
             &mut codex_pool,
             &mut codex_checked,
-            GmailWriteOptions {
-                batch_size: args.gmail_batch_size,
-                batch_retries: args.gmail_batch_retries,
-                batch_retry_backoff_secs: args.gmail_batch_retry_backoff_secs,
-            },
+            default_write_options(),
         )
         .expect("process_once should succeed");
 
@@ -1234,11 +1176,7 @@ mod tests {
             1,
             &mut codex_pool,
             &mut codex_checked,
-            GmailWriteOptions {
-                batch_size: args.gmail_batch_size,
-                batch_retries: args.gmail_batch_retries,
-                batch_retry_backoff_secs: args.gmail_batch_retry_backoff_secs,
-            },
+            default_write_options(),
         )
         .expect("process_once should succeed");
 
