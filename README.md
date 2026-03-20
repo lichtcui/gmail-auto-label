@@ -52,7 +52,7 @@ gog auth list
 5. For multiple accounts, pass account name when running this tool:
 
 ```bash
-cargo run -- --account your-account-name
+gmail-auto-label --account your-account-name
 ```
 
 Note: all Gmail operations are executed through `gog`. If auth or permissions are missing, the tool will fail at runtime.
@@ -100,7 +100,13 @@ cargo install gmail-auto-label
 Optional (pin a version):
 
 ```bash
-cargo install gmail-auto-label --version 0.1.1
+cargo install gmail-auto-label --version 0.1.2
+```
+
+After installation, run the binary directly:
+
+```bash
+gmail-auto-label --help
 ```
 
 ## Common Usage
@@ -108,19 +114,19 @@ cargo install gmail-auto-label --version 0.1.1
 1. Single pass (default: 20 threads):
 
 ```bash
-cargo run -- --limit 20
+gmail-auto-label --limit 20
 ```
 
 2. Dry run (no write operations):
 
 ```bash
-cargo run -- --dry-run --limit 20
+gmail-auto-label --dry-run --limit 20
 ```
 
 3. Watch mode (every 5 minutes):
 
 ```bash
-cargo run -- --watch 300
+gmail-auto-label --watch 300
 ```
 
 If a round finds no pending inbox threads, watch mode waits for the next interval instead of exiting.
@@ -128,13 +134,13 @@ If a round finds no pending inbox threads, watch mode waits for the next interva
 4. Keep messages in inbox (label only, no archive):
 
 ```bash
-cargo run -- --keep-inbox
+gmail-auto-label --keep-inbox
 ```
 
 5. Use custom label rules:
 
 ```bash
-cargo run -- --custom-labels-file ./custom-labels.json
+gmail-auto-label --custom-labels-file ./custom-labels.json
 ```
 
 ## Key Options
@@ -205,5 +211,5 @@ Validation rules:
 ## Help
 
 ```bash
-cargo run -- --help
+gmail-auto-label --help
 ```

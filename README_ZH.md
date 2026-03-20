@@ -52,7 +52,7 @@ gog auth list
 5. 多账号场景运行时可指定账号：
 
 ```bash
-cargo run -- --account your-account-name
+gmail-auto-label --account your-account-name
 ```
 
 说明：程序所有 Gmail 操作都通过 `gog` 执行。若认证缺失或权限不足，程序会在运行时报错。
@@ -100,7 +100,13 @@ cargo install gmail-auto-label
 可选：指定版本安装
 
 ```bash
-cargo install gmail-auto-label --version 0.1.1
+cargo install gmail-auto-label --version 0.1.2
+```
+
+安装后可直接执行命令：
+
+```bash
+gmail-auto-label --help
 ```
 
 ## 常用用法
@@ -108,19 +114,19 @@ cargo install gmail-auto-label --version 0.1.1
 1. 单轮处理（默认 20 封）：
 
 ```bash
-cargo run -- --limit 20
+gmail-auto-label --limit 20
 ```
 
 2. 演练模式（不落地写入）：
 
 ```bash
-cargo run -- --dry-run --limit 20
+gmail-auto-label --dry-run --limit 20
 ```
 
 3. 轮询模式（每 5 分钟一轮）：
 
 ```bash
-cargo run -- --watch 300
+gmail-auto-label --watch 300
 ```
 
 若某一轮没有待处理邮件，轮询模式会等待下一次间隔继续执行，而不是直接退出。
@@ -128,13 +134,13 @@ cargo run -- --watch 300
 4. 仅打标签，不归档（保留收件箱）：
 
 ```bash
-cargo run -- --keep-inbox
+gmail-auto-label --keep-inbox
 ```
 
 5. 使用自定义标签规则：
 
 ```bash
-cargo run -- --custom-labels-file ./custom-labels.json
+gmail-auto-label --custom-labels-file ./custom-labels.json
 ```
 
 ## 关键参数
@@ -205,5 +211,5 @@ cargo run -- --custom-labels-file ./custom-labels.json
 ## 查看帮助
 
 ```bash
-cargo run -- --help
+gmail-auto-label --help
 ```
