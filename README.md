@@ -13,6 +13,7 @@ This is the primary documentation.
 ## Features
 
 - Auto-scan inbox threads and classify emails into business-friendly labels
+- Optional custom label rules with higher priority than memoized, learned, and Codex-generated matches
 - Cache-first classification (memo + reusable rules) to reduce repeated LLM calls
 - Codex fallback for uncached emails, then persist extracted rules for later reuse
 - Auto-create missing Gmail labels and apply labels in batches
@@ -122,10 +123,18 @@ cargo run -- --dry-run --limit 20
 cargo run -- --watch 300
 ```
 
+If a round finds no pending inbox threads, watch mode waits for the next interval instead of exiting.
+
 4. Keep messages in inbox (label only, no archive):
 
 ```bash
 cargo run -- --keep-inbox
+```
+
+5. Use custom label rules:
+
+```bash
+cargo run -- --custom-labels-file ./custom-labels.json
 ```
 
 ## Key Options
@@ -134,6 +143,7 @@ cargo run -- --keep-inbox
 - `--watch`: polling interval in seconds, for example `--watch 300`
 - `--account`: gog account name
 - `--dry-run`: print actions only, no writes
+- `--custom-labels-file`: load custom label rules from a JSON file
 - `--max-labels`: max active labels, default `10`
 - `--keep-inbox`: do not remove processed threads from inbox
 
@@ -162,6 +172,35 @@ Built-in feedback file format (internal path is fixed to `/tmp/gmail_auto_label_
 Notes:
 - `event_id` must be unique; duplicated/replayed events are skipped.
 - `ts` uses Unix seconds; stale events older than the built-in feedback retention window are skipped.
+
+## Custom Label Rules
+
+Use `--custom-labels-file <path>` to load user-defined label rules before a run starts. Matching order is:
+
+1. Custom label rules
+2. Memoized matches
+3. Learned rules
+4. Codex fallback
+
+Rules are evaluated in file order, first match wins. Custom labels are not auto-pruned by feedback and are not merged into the learned-label compression target.
+
+Example file:
+
+```json
+[
+  {
+    "label": "Important Client",
+    "include_keywords": ["vip", "invoice"],
+    "exclude_keywords": ["spam"]
+  }
+]
+```
+
+Validation rules:
+- File must be readable JSON
+- Top-level value must be an array
+- Each rule must include a non-empty `label`
+- Each rule must include at least one non-empty `include_keywords` value
 
 ## Help
 

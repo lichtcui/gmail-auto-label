@@ -8,11 +8,12 @@ use rayon::ThreadPool;
 use rayon::prelude::*;
 
 use crate::cache::{
-    apply_feedback_from_file, cache_fingerprint, load_cache, memo_key, prune_cache, save_cache,
+    apply_feedback_from_file, cache_fingerprint, load_cache, load_custom_label_rules, memo_key,
+    prune_cache, save_cache,
 };
 use crate::classify::{
     build_rule_priority_indexes, classify_from_cache_with_indexes, classify_with_codex_result,
-    codex_analyze_email, codex_error_hint, compress_labels_if_needed,
+    classify_with_custom_rules, codex_analyze_email, codex_error_hint, compress_labels_if_needed,
     ensure_codex_command_available,
 };
 use crate::errors::AppError;
@@ -21,9 +22,10 @@ use crate::gog::{
     fetch_existing_labels, fetch_pending,
 };
 use crate::models::{
-    Args, CacheData, CodexClassify, DEFAULT_CACHE_MAX_MEMOS, DEFAULT_CACHE_MAX_RULES,
-    DEFAULT_CACHE_TTL_HOURS, DEFAULT_FEEDBACK_BAD_THRESHOLD, DEFAULT_FEEDBACK_FILE,
-    DEFAULT_FEEDBACK_HIT_PENALTY, DEFAULT_FEEDBACK_MAX_AGE_HOURS, ProcessedThread, ThreadInfo,
+    Args, CacheData, CodexClassify, CustomLabelRule, DEFAULT_CACHE_MAX_MEMOS,
+    DEFAULT_CACHE_MAX_RULES, DEFAULT_CACHE_TTL_HOURS, DEFAULT_FEEDBACK_BAD_THRESHOLD,
+    DEFAULT_FEEDBACK_FILE, DEFAULT_FEEDBACK_HIT_PENALTY, DEFAULT_FEEDBACK_MAX_AGE_HOURS,
+    ProcessedThread, ThreadInfo,
 };
 use crate::utils::{auto_codex_workers, log, now_ts, resolve_label_alias};
 
@@ -177,6 +179,7 @@ impl AppDeps for RealDeps {
 
 #[allow(clippy::type_complexity)]
 fn collect_threads(
+    custom_rules: &[CustomLabelRule],
     cache: &mut CacheData,
     threads: &[ThreadInfo],
 ) -> std::result::Result<
@@ -185,6 +188,7 @@ fn collect_threads(
         Vec<String>,
         Vec<ThreadInfo>,
         RoundMetrics,
+        HashSet<String>,
     ),
     DynErr,
 > {
@@ -196,9 +200,20 @@ fn collect_threads(
     let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
     let mut processed_ids: Vec<String> = Vec::new();
     let mut codex_jobs: Vec<ThreadInfo> = Vec::new();
+    let mut custom_labels = HashSet::new();
 
     for t in threads {
-        if let Some((label, source)) = classify_from_cache_with_indexes(
+        if let Some((label, source)) =
+            classify_with_custom_rules(&t.sender, &t.subject, &t.snippet, custom_rules)
+        {
+            custom_labels.insert(label.clone());
+            grouped.entry(label.clone()).or_default().push(t.id.clone());
+            processed_ids.push(t.id.clone());
+            log(&format!(
+                "分类: 线程={} 标签={} 来源={} 总结=自定义规则命中",
+                t.id, label, source
+            ));
+        } else if let Some((label, source)) = classify_from_cache_with_indexes(
             &t.sender,
             &t.subject,
             &t.snippet,
@@ -219,7 +234,7 @@ fn collect_threads(
     }
 
     metrics.codex_jobs = codex_jobs.len();
-    Ok((grouped, processed_ids, codex_jobs, metrics))
+    Ok((grouped, processed_ids, codex_jobs, metrics, custom_labels))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -323,13 +338,18 @@ fn run_codex_for_jobs<D: AppDeps>(
 fn regroup_by_alias(
     grouped: HashMap<String, Vec<String>>,
     cache: &CacheData,
+    custom_labels: &HashSet<String>,
 ) -> HashMap<String, Vec<String>> {
     if cache.label_aliases.is_empty() {
         return grouped;
     }
     let mut regrouped: HashMap<String, Vec<String>> = HashMap::new();
     for (label, ids) in grouped {
-        let final_label = resolve_label_alias(&label, cache);
+        let final_label = if custom_labels.contains(&label) {
+            label
+        } else {
+            resolve_label_alias(&label, cache)
+        };
         regrouped.entry(final_label).or_default().extend(ids);
     }
     regrouped
@@ -427,6 +447,7 @@ fn remember_processed_keep_inbox_threads(
 fn process_once_with_deps<D: AppDeps>(
     deps: &D,
     args: &Args,
+    custom_rules: &[CustomLabelRule],
     cache: &mut CacheData,
     existing_labels: &mut HashSet<String>,
     effective_workers: usize,
@@ -445,8 +466,8 @@ fn process_once_with_deps<D: AppDeps>(
         return Ok(("idle".to_string(), RoundMetrics::default()));
     }
 
-    let (mut grouped, mut processed_ids, codex_jobs, mut metrics) =
-        collect_threads(cache, &threads)?;
+    let (mut grouped, mut processed_ids, codex_jobs, mut metrics, custom_labels) =
+        collect_threads(custom_rules, cache, &threads)?;
     if !codex_jobs.is_empty() && !*codex_checked {
         deps.ensure_codex_ready(&args.codex_cmd)?;
         *codex_checked = true;
@@ -465,7 +486,7 @@ fn process_once_with_deps<D: AppDeps>(
     metrics.codex_failures = codex_failures;
 
     compress_labels_if_needed(cache, args.max_labels, &args.merged_label);
-    let grouped = regroup_by_alias(grouped, cache);
+    let grouped = regroup_by_alias(grouped, cache, &custom_labels);
     ensure_grouped_labels_exist(deps, &grouped, args, existing_labels)?;
     deps.apply_labels(&grouped, &args.account, args.dry_run, write_options)?;
     if args.keep_inbox {
@@ -507,6 +528,10 @@ fn validate_args(args: &Args) -> Result<()> {
     Ok(())
 }
 
+fn should_continue_after_round(args: &Args, _state: &str) -> bool {
+    args.watch_interval_secs().is_some()
+}
+
 pub(crate) fn build_gog_setup_error(raw_error: &str, account: &Option<String>) -> AppError {
     let account_hint = account
         .as_ref()
@@ -537,9 +562,35 @@ pub(crate) fn build_codex_setup_error(raw_error: &str, codex_cmd: &str) -> AppEr
     ))
 }
 
+pub(crate) fn build_custom_labels_setup_error(raw_error: &str, path: &str) -> AppError {
+    AppError::Config(format!(
+        "自定义标签配置检查失败。\n\
+         原始错误: {raw_error}\n\
+         当前 --custom-labels-file: `{path}`\n\n\
+         排查建议:\n\
+         1. 确认文件存在且可读\n\
+         2. 确认文件内容是 JSON 数组\n\
+         3. 每条规则必须包含非空 `label`\n\
+         4. 每条规则至少提供 1 个 `include_keywords`\n\
+         5. 示例: [{{\"label\":\"重要客户\",\"include_keywords\":[\"vip\",\"invoice\"],\"exclude_keywords\":[\"spam\"]}}]"
+    ))
+}
+
 pub(crate) fn run() -> Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
+
+    let custom_label_rules = match &args.custom_labels_file {
+        Some(path) => load_custom_label_rules(path)
+            .map_err(|e| anyhow!(build_custom_labels_setup_error(&e.to_string(), path)))?,
+        None => Vec::new(),
+    };
+    if !custom_label_rules.is_empty() {
+        log(&format!(
+            "已加载 {} 条自定义标签规则",
+            custom_label_rules.len()
+        ));
+    }
 
     let effective_workers = auto_codex_workers(args.limit);
     log(&format!("Codex 并发设置: {}", effective_workers));
@@ -584,6 +635,7 @@ pub(crate) fn run() -> Result<()> {
         let (state, metrics) = match process_once_with_deps(
             &RealDeps,
             &args,
+            &custom_label_rules,
             &mut cache,
             &mut existing_labels,
             effective_workers,
@@ -644,12 +696,12 @@ pub(crate) fn run() -> Result<()> {
             last_saved_fingerprint = current_fingerprint;
         }
 
-        let Some(interval_secs) = args.watch_interval_secs() else {
-            break;
-        };
-        if state == "done" {
+        if !should_continue_after_round(&args, &state) {
             break;
         }
+        let interval_secs = args
+            .watch_interval_secs()
+            .expect("watch interval should exist when continuing");
 
         log(&format!("休眠 {} 秒后继续...", interval_secs));
         thread::sleep(Duration::from_secs(interval_secs));
@@ -666,7 +718,8 @@ mod tests {
     use crate::cache::memo_key;
     use crate::classify::{codex_error_hint, rule_matches};
     use crate::models::{
-        DEFAULT_CACHE_FILE, DEFAULT_MAX_ACTIVE_LABELS, DEFAULT_MERGED_LABEL, Rule, RuleInput,
+        CustomLabelRule, DEFAULT_CACHE_FILE, DEFAULT_MAX_ACTIVE_LABELS, DEFAULT_MERGED_LABEL,
+        Rule, RuleInput,
     };
     use crate::utils::{normalize_label, now_ts};
 
@@ -756,6 +809,7 @@ mod tests {
             dry_run: false,
             codex_cmd: "codex exec".to_string(),
             cache_file: DEFAULT_CACHE_FILE.to_string(),
+            custom_labels_file: None,
             max_labels: DEFAULT_MAX_ACTIVE_LABELS,
             merged_label: DEFAULT_MERGED_LABEL.to_string(),
             keep_inbox: false,
@@ -764,6 +818,14 @@ mod tests {
 
     fn default_write_options() -> GmailWriteOptions {
         GmailWriteOptions::default()
+    }
+
+    fn custom_rule(label: &str, include_keywords: &[&str]) -> CustomLabelRule {
+        CustomLabelRule {
+            label: label.to_string(),
+            include_keywords: include_keywords.iter().map(|x| x.to_string()).collect(),
+            exclude_keywords: Vec::new(),
+        }
     }
 
     #[test]
@@ -809,6 +871,15 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_labels_setup_error_contains_fix_steps() {
+        let err =
+            build_custom_labels_setup_error("invalid json", "/tmp/custom-labels.json").to_string();
+        assert!(err.contains("自定义标签配置检查失败"));
+        assert!(err.contains("--custom-labels-file"));
+        assert!(err.contains("JSON 数组"));
+    }
+
+    #[test]
     fn test_codex_error_hint_for_not_found() {
         let hint = codex_error_hint("codex_not_found").unwrap_or("");
         assert!(hint.contains("--codex-cmd"));
@@ -847,6 +918,7 @@ mod tests {
         let (state, metrics) = process_once_with_deps(
             &deps,
             &args,
+            &[],
             &mut cache,
             &mut existing_labels,
             1,
@@ -896,6 +968,93 @@ mod tests {
     }
 
     #[test]
+    fn test_should_continue_after_round_respects_watch_mode() {
+        let single_run = make_args();
+        assert!(!should_continue_after_round(&single_run, "processed"));
+
+        let mut watch_args = make_args();
+        watch_args.watch = Some(300);
+        assert!(should_continue_after_round(&watch_args, "done"));
+        assert!(should_continue_after_round(&watch_args, "idle"));
+    }
+
+    #[test]
+    fn test_custom_rule_takes_precedence_without_mutating_learned_state() {
+        let thread = ThreadInfo {
+            id: "t-custom".to_string(),
+            sender: "vip@example.com".to_string(),
+            subject: "invoice ready".to_string(),
+            snippet: "vip invoice".to_string(),
+        };
+        let deps = MockDeps {
+            pending: vec![thread.clone()],
+            codex_result: CodexClassify {
+                ok: true,
+                label: "不应触发".to_string(),
+                summary: "unused".to_string(),
+                rule: RuleInput::default(),
+            },
+            applied: Mutex::new(Vec::new()),
+            archived: Mutex::new(Vec::new()),
+            codex_calls: Mutex::new(0),
+            codex_ready_calls: Mutex::new(0),
+        };
+        let args = make_args();
+        let custom_rules = vec![custom_rule("重要客户", &["vip", "invoice"])];
+
+        let mut cache = CacheData::default();
+        let mkey = memo_key(&thread.sender, &thread.subject, &thread.snippet);
+        cache.memos.insert(
+            mkey.clone(),
+            crate::models::Memo {
+                label: "旧缓存标签".to_string(),
+                rule_id: "r-old".to_string(),
+                ts: now_ts(),
+            },
+        );
+        cache.rules.push(Rule {
+            id: "r-learned".to_string(),
+            label: "学习标签".to_string(),
+            include_keywords: vec!["invoice".to_string()],
+            hits: 5,
+            updated_at: now_ts(),
+            ..Default::default()
+        });
+
+        let mut existing_labels = HashSet::new();
+        let mut codex_pool: Option<ThreadPool> = None;
+        let mut codex_checked = false;
+
+        let (state, metrics) = process_once_with_deps(
+            &deps,
+            &args,
+            &custom_rules,
+            &mut cache,
+            &mut existing_labels,
+            1,
+            &mut codex_pool,
+            &mut codex_checked,
+            default_write_options(),
+        )
+        .expect("process_once should succeed");
+
+        assert_eq!(state, "processed");
+        assert_eq!(metrics.cache_hits, 0);
+        assert_eq!(metrics.codex_jobs, 0);
+        assert_eq!(*deps.codex_calls.lock().expect("lock poisoned"), 0);
+
+        let applied = deps.applied.lock().expect("lock poisoned");
+        let grouped = &applied[0];
+        let ids = grouped.get("重要客户").expect("expected custom label");
+        assert_eq!(ids, &vec!["t-custom".to_string()]);
+
+        assert_eq!(cache.rules.len(), 1);
+        assert_eq!(cache.rules[0].label, "学习标签");
+        let memo = cache.memos.get(&mkey).expect("existing memo should remain");
+        assert_eq!(memo.label, "旧缓存标签");
+    }
+
+    #[test]
     fn test_e2e_cache_hit_path_skips_codex() {
         let mut cache = CacheData::default();
         cache.rules.push(Rule {
@@ -931,6 +1090,7 @@ mod tests {
         let (state, metrics) = process_once_with_deps(
             &deps,
             &args,
+            &[],
             &mut cache,
             &mut existing_labels,
             1,
@@ -976,6 +1136,7 @@ mod tests {
         let (state, metrics) = process_once_with_deps(
             &deps,
             &args,
+            &[],
             &mut cache,
             &mut existing_labels,
             1,
@@ -1045,6 +1206,7 @@ mod tests {
         let (state, metrics) = process_once_with_deps(
             &deps,
             &args,
+            &[],
             &mut cache,
             &mut existing_labels,
             1,
@@ -1066,6 +1228,88 @@ mod tests {
             .get("统一收纳")
             .expect("expected merged label to be applied");
         assert_eq!(ids, &vec!["t-merge".to_string()]);
+    }
+
+    #[test]
+    fn test_custom_label_skips_alias_merge() {
+        let thread = ThreadInfo {
+            id: "t-custom-merge".to_string(),
+            sender: "vip@example.com".to_string(),
+            subject: "vip sync".to_string(),
+            snippet: "vip meeting".to_string(),
+        };
+        let deps = MockDeps {
+            pending: vec![thread.clone()],
+            codex_result: CodexClassify {
+                ok: true,
+                label: "不应触发".to_string(),
+                summary: "unused".to_string(),
+                rule: RuleInput::default(),
+            },
+            applied: Mutex::new(Vec::new()),
+            archived: Mutex::new(Vec::new()),
+            codex_calls: Mutex::new(0),
+            codex_ready_calls: Mutex::new(0),
+        };
+        let mut args = make_args();
+        args.max_labels = 2;
+        args.merged_label = "统一收纳".to_string();
+        let custom_rules = vec![custom_rule("重要客户", &["vip"])];
+
+        let mut cache = CacheData::default();
+        cache.rules.push(Rule {
+            id: "r-finance".to_string(),
+            label: "财务".to_string(),
+            include_keywords: vec!["invoice".to_string()],
+            hits: 10,
+            updated_at: 100,
+            ..Default::default()
+        });
+        cache.rules.push(Rule {
+            id: "r-subscription".to_string(),
+            label: "订阅".to_string(),
+            include_keywords: vec!["newsletter".to_string()],
+            hits: 9,
+            updated_at: 90,
+            ..Default::default()
+        });
+        cache.rules.push(Rule {
+            id: "r-custom-shadow".to_string(),
+            label: "重要客户".to_string(),
+            include_keywords: vec!["vip".to_string()],
+            hits: 1,
+            updated_at: 10,
+            ..Default::default()
+        });
+
+        let mut existing_labels = HashSet::new();
+        let mut codex_pool: Option<ThreadPool> = None;
+        let mut codex_checked = false;
+
+        let (state, metrics) = process_once_with_deps(
+            &deps,
+            &args,
+            &custom_rules,
+            &mut cache,
+            &mut existing_labels,
+            1,
+            &mut codex_pool,
+            &mut codex_checked,
+            default_write_options(),
+        )
+        .expect("process_once should succeed");
+
+        assert_eq!(state, "processed");
+        assert_eq!(metrics.codex_jobs, 0);
+        assert!(existing_labels.contains("重要客户"));
+        assert!(!existing_labels.contains("统一收纳"));
+
+        let applied = deps.applied.lock().expect("lock poisoned");
+        let grouped = &applied[0];
+        let ids = grouped
+            .get("重要客户")
+            .expect("expected custom label to bypass alias merge");
+        assert_eq!(ids, &vec!["t-custom-merge".to_string()]);
     }
 
     #[test]
@@ -1112,6 +1356,7 @@ mod tests {
         let (state, metrics) = process_once_with_deps(
             &deps,
             &args,
+            &[],
             &mut cache,
             &mut existing_labels,
             1,
@@ -1172,6 +1417,7 @@ mod tests {
         let (state, metrics) = process_once_with_deps(
             &deps,
             &args,
+            &[],
             &mut cache,
             &mut existing_labels,
             1,

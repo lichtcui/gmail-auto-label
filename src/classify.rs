@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::cache::{memo_key, rule_id};
 use crate::command::{CommandRunner, SystemCommandRunner};
-use crate::models::{CacheData, CodexClassify, Memo, Rule, RuleInput};
+use crate::models::{CacheData, CodexClassify, CustomLabelRule, Memo, Rule, RuleInput};
 use crate::utils::{log, normalize_label, now_ts, resolve_label_alias};
 
 const CODEX_TIMEOUT_SECONDS: u64 = 25;
@@ -25,10 +25,10 @@ fn normalized_match_text(sender: &str, subject: &str, snippet: &str) -> String {
     format!("{sender} {subject} {snippet}").to_lowercase()
 }
 
-fn rule_matches_text(rule: &Rule, text: &str) -> bool {
+fn keywords_match_text(include_keywords: &[String], exclude_keywords: &[String], text: &str) -> bool {
     let mut has_include = false;
     let mut include_matched = false;
-    for raw in &rule.include_keywords {
+    for raw in include_keywords {
         let kw = raw.trim();
         if kw.is_empty() {
             continue;
@@ -43,7 +43,7 @@ fn rule_matches_text(rule: &Rule, text: &str) -> bool {
         return false;
     }
 
-    for raw in &rule.exclude_keywords {
+    for raw in exclude_keywords {
         let kw = raw.trim();
         if kw.is_empty() {
             continue;
@@ -54,6 +54,31 @@ fn rule_matches_text(rule: &Rule, text: &str) -> bool {
     }
 
     has_include
+}
+
+fn rule_matches_text(rule: &Rule, text: &str) -> bool {
+    keywords_match_text(&rule.include_keywords, &rule.exclude_keywords, text)
+}
+
+pub(crate) fn classify_with_custom_rules(
+    sender: &str,
+    subject: &str,
+    snippet: &str,
+    custom_rules: &[CustomLabelRule],
+) -> Option<(String, String)> {
+    if custom_rules.is_empty() {
+        return None;
+    }
+
+    let text = normalized_match_text(sender, subject, snippet);
+    for (idx, rule) in custom_rules.iter().enumerate() {
+        if !keywords_match_text(&rule.include_keywords, &rule.exclude_keywords, &text) {
+            continue;
+        }
+        return Some((rule.label.clone(), format!("custom:{}", idx + 1)));
+    }
+
+    None
 }
 
 #[cfg(test)]

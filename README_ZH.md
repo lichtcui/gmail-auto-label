@@ -13,6 +13,7 @@
 ## 功能描述
 
 - 自动扫描收件箱线程，并按业务语义打 Gmail 标签
+- 支持可选的自定义标签规则，并且优先于缓存命中、学习规则和 Codex 分类
 - 缓存优先分类（记忆 + 可复用规则），减少重复调用大模型
 - 缓存未命中时调用 Codex 分类，并把规则回写到本地缓存
 - 自动创建缺失标签，并按标签批量回写邮件线程
@@ -122,10 +123,18 @@ cargo run -- --dry-run --limit 20
 cargo run -- --watch 300
 ```
 
+若某一轮没有待处理邮件，轮询模式会等待下一次间隔继续执行，而不是直接退出。
+
 4. 仅打标签，不归档（保留收件箱）：
 
 ```bash
 cargo run -- --keep-inbox
+```
+
+5. 使用自定义标签规则：
+
+```bash
+cargo run -- --custom-labels-file ./custom-labels.json
 ```
 
 ## 关键参数
@@ -134,6 +143,7 @@ cargo run -- --keep-inbox
 - `--watch`：按秒轮询，例如 `--watch 300`
 - `--account`：指定 gog 账号名
 - `--dry-run`：只打印操作，不执行写入
+- `--custom-labels-file`：从 JSON 文件加载自定义标签规则
 - `--max-labels`：最大活跃标签数，默认 `10`
 - `--keep-inbox`：处理后不移出收件箱
 
@@ -162,6 +172,35 @@ cargo run -- --keep-inbox
 说明：
 - `event_id` 需唯一，重复/回放事件会被跳过。
 - `ts` 为 Unix 秒时间戳，超过内置反馈时效的过期事件会被跳过。
+
+## 自定义标签规则
+
+使用 `--custom-labels-file <path>` 可以在每次运行开始前加载用户自定义的标签规则。匹配优先级如下：
+
+1. 自定义标签规则
+2. Memo 缓存命中
+3. 学习得到的规则
+4. Codex 兜底分类
+
+规则按文件顺序匹配，命中第一条就停止。自定义标签不会被反馈机制自动删除，也不会被学习标签压缩逻辑合并到默认归并标签。
+
+示例文件：
+
+```json
+[
+  {
+    "label": "重要客户",
+    "include_keywords": ["vip", "invoice"],
+    "exclude_keywords": ["spam"]
+  }
+]
+```
+
+校验规则：
+- 文件必须是可读取的 JSON
+- 顶层结构必须是数组
+- 每条规则必须包含非空 `label`
+- 每条规则至少包含 1 个非空 `include_keywords`
 
 ## 查看帮助
 

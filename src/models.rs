@@ -38,6 +38,8 @@ pub(crate) struct Args {
     pub(crate) codex_cmd: String,
     #[arg(long, hide = true, default_value = DEFAULT_CACHE_FILE)]
     pub(crate) cache_file: String,
+    #[arg(long, value_name = "PATH")]
+    pub(crate) custom_labels_file: Option<String>,
     #[arg(long, default_value_t = DEFAULT_MAX_ACTIVE_LABELS)]
     pub(crate) max_labels: usize,
     #[arg(long, hide = true, default_value = DEFAULT_MERGED_LABEL)]
@@ -134,6 +136,16 @@ pub(crate) struct CodexClassify {
 pub(crate) struct RuleInput {
     #[serde(default)]
     pub(crate) description: String,
+    #[serde(default)]
+    pub(crate) include_keywords: Vec<String>,
+    #[serde(default)]
+    pub(crate) exclude_keywords: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(crate) struct CustomLabelRule {
+    #[serde(default)]
+    pub(crate) label: String,
     #[serde(default)]
     pub(crate) include_keywords: Vec<String>,
     #[serde(default)]
