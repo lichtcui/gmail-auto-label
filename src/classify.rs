@@ -25,7 +25,11 @@ fn normalized_match_text(sender: &str, subject: &str, snippet: &str) -> String {
     format!("{sender} {subject} {snippet}").to_lowercase()
 }
 
-fn keywords_match_text(include_keywords: &[String], exclude_keywords: &[String], text: &str) -> bool {
+fn keywords_match_text(
+    include_keywords: &[String],
+    exclude_keywords: &[String],
+    text: &str,
+) -> bool {
     let mut has_include = false;
     let mut include_matched = false;
     for raw in include_keywords {

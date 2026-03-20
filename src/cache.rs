@@ -9,9 +9,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::models::{
-    CACHE_VERSION, CacheData, CustomLabelRule, DEFAULT_FEEDBACK_MAX_APPLIED_IDS,
-};
+use crate::models::{CACHE_VERSION, CacheData, CustomLabelRule, DEFAULT_FEEDBACK_MAX_APPLIED_IDS};
 use crate::utils::{log, normalize_label, now_ts};
 
 fn sha256_hex(input: &str) -> String {
@@ -97,7 +95,10 @@ pub(crate) fn load_custom_label_rules(path: &str) -> Result<Vec<CustomLabelRule>
         rule.exclude_keywords = normalize_keywords(&rule.exclude_keywords);
 
         if rule.include_keywords.is_empty() {
-            bail!("第 {} 条自定义标签规则至少需要 1 个 include_keywords", idx + 1);
+            bail!(
+                "第 {} 条自定义标签规则至少需要 1 个 include_keywords",
+                idx + 1
+            );
         }
     }
 

@@ -718,8 +718,8 @@ mod tests {
     use crate::cache::memo_key;
     use crate::classify::{codex_error_hint, rule_matches};
     use crate::models::{
-        CustomLabelRule, DEFAULT_CACHE_FILE, DEFAULT_MAX_ACTIVE_LABELS, DEFAULT_MERGED_LABEL,
-        Rule, RuleInput,
+        CustomLabelRule, DEFAULT_CACHE_FILE, DEFAULT_MAX_ACTIVE_LABELS, DEFAULT_MERGED_LABEL, Rule,
+        RuleInput,
     };
     use crate::utils::{normalize_label, now_ts};
 
