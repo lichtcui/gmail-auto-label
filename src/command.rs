@@ -28,14 +28,8 @@ fn join_output_reader(
 
 fn run_cmd_with_timeout(mut cmd: Command, timeout_secs: u64) -> Result<(i32, String, String)> {
     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("无法获取子进程 stdout 管道")?;
-    let stderr = child
-        .stderr
-        .take()
-        .context("无法获取子进程 stderr 管道")?;
+    let stdout = child.stdout.take().context("无法获取子进程 stdout 管道")?;
+    let stderr = child.stderr.take().context("无法获取子进程 stderr 管道")?;
     let stdout_handle = spawn_output_reader(stdout);
     let stderr_handle = spawn_output_reader(stderr);
 
@@ -73,8 +67,7 @@ mod tests {
             "dd if=/dev/zero bs=65536 count=4 2>/dev/null; dd if=/dev/zero bs=65536 count=4 1>&2 2>/dev/null",
         ]);
 
-        let (code, stdout, stderr) =
-            run_cmd_with_timeout(cmd, 5).expect("command should complete");
+        let (code, stdout, stderr) = run_cmd_with_timeout(cmd, 5).expect("command should complete");
 
         assert_eq!(code, 0);
         assert!(stdout.len() >= 4 * 65536);

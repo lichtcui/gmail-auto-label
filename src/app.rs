@@ -21,9 +21,9 @@ use crate::gog::{
     fetch_existing_labels, fetch_pending,
 };
 use crate::models::{
-    Args, CacheData, CodexClassify, ProcessedThread, ThreadInfo, DEFAULT_CACHE_MAX_MEMOS,
-    DEFAULT_CACHE_MAX_RULES, DEFAULT_CACHE_TTL_HOURS, DEFAULT_FEEDBACK_BAD_THRESHOLD,
-    DEFAULT_FEEDBACK_FILE, DEFAULT_FEEDBACK_HIT_PENALTY, DEFAULT_FEEDBACK_MAX_AGE_HOURS,
+    Args, CacheData, CodexClassify, DEFAULT_CACHE_MAX_MEMOS, DEFAULT_CACHE_MAX_RULES,
+    DEFAULT_CACHE_TTL_HOURS, DEFAULT_FEEDBACK_BAD_THRESHOLD, DEFAULT_FEEDBACK_FILE,
+    DEFAULT_FEEDBACK_HIT_PENALTY, DEFAULT_FEEDBACK_MAX_AGE_HOURS, ProcessedThread, ThreadInfo,
 };
 use crate::utils::{auto_codex_workers, log, now_ts, resolve_label_alias};
 
@@ -266,14 +266,14 @@ fn run_codex_for_jobs<D: AppDeps>(
             codex_jobs
                 .into_par_iter()
                 .map(|job| {
-                        let res = deps.codex_analyze_email(
-                            &job.sender,
-                            &job.subject,
-                            &job.snippet,
-                            codex_cmd,
-                        );
-                        (job, res)
-                    })
+                    let res = deps.codex_analyze_email(
+                        &job.sender,
+                        &job.subject,
+                        &job.snippet,
+                        codex_cmd,
+                    );
+                    (job, res)
+                })
                 .collect::<Vec<_>>()
         })
     };
@@ -439,8 +439,7 @@ fn process_once_with_deps<D: AppDeps>(
         log("DONE_NO_PENDING: 没有待整理邮件，任务结束。");
         return Ok(("done".to_string(), RoundMetrics::default()));
     }
-    let threads =
-        filter_recently_processed_keep_inbox_threads(args, cache, pending_threads);
+    let threads = filter_recently_processed_keep_inbox_threads(args, cache, pending_threads);
     if threads.is_empty() {
         log("IDLE_NO_ELIGIBLE: 当前仅命中已处理且内容未变化的线程，等待下轮。");
         return Ok(("idle".to_string(), RoundMetrics::default()));
@@ -666,7 +665,9 @@ mod tests {
     use super::*;
     use crate::cache::memo_key;
     use crate::classify::{codex_error_hint, rule_matches};
-    use crate::models::{DEFAULT_CACHE_FILE, DEFAULT_MAX_ACTIVE_LABELS, DEFAULT_MERGED_LABEL, Rule, RuleInput};
+    use crate::models::{
+        DEFAULT_CACHE_FILE, DEFAULT_MAX_ACTIVE_LABELS, DEFAULT_MERGED_LABEL, Rule, RuleInput,
+    };
     use crate::utils::{normalize_label, now_ts};
 
     struct MockDeps {

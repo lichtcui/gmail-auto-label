@@ -48,8 +48,11 @@ pub(crate) struct Args {
 
 impl Args {
     pub(crate) fn watch_interval_secs(&self) -> Option<u64> {
-        self.watch
-            .or(if self.r#loop { Some(self.interval) } else { None })
+        self.watch.or(if self.r#loop {
+            Some(self.interval)
+        } else {
+            None
+        })
     }
 }
 

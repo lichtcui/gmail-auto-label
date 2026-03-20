@@ -92,13 +92,8 @@ pub(crate) fn save_cache(path: &str, cache: &CacheData) -> Result<()> {
         file.sync_all()
             .with_context(|| format!("同步缓存临时文件失败: {}", tmp.display()))?;
     }
-    fs::rename(&tmp, p).with_context(|| {
-        format!(
-            "替换缓存文件失败: {} -> {}",
-            tmp.display(),
-            p.display()
-        )
-    })
+    fs::rename(&tmp, p)
+        .with_context(|| format!("替换缓存文件失败: {} -> {}", tmp.display(), p.display()))
 }
 
 pub(crate) fn cache_fingerprint(cache: &CacheData) -> Result<String> {
@@ -445,7 +440,10 @@ mod tests {
 
         assert_eq!(loaded.version, CACHE_VERSION);
         assert_eq!(loaded.rules.len(), 1);
-        assert_eq!(loaded.rules[0].include_keywords, vec!["invoice".to_string()]);
+        assert_eq!(
+            loaded.rules[0].include_keywords,
+            vec!["invoice".to_string()]
+        );
         assert!(loaded.processed_threads.contains_key("t1"));
 
         let _ = fs::remove_file(&path);
