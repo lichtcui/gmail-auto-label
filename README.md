@@ -89,9 +89,9 @@ Binary:
 ./target/release/gmail-auto-label
 ```
 
-## Install from crates.io (after publish)
+## Install from crates.io
 
-Once this crate is published, install with:
+Install with:
 
 ```bash
 cargo install gmail-auto-label

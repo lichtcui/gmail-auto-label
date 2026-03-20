@@ -89,9 +89,9 @@ cargo build --release
 ./target/release/gmail-auto-label
 ```
 
-## 发布到 crates.io 后安装
+## 通过 crates.io 安装
 
-发布完成后可直接安装：
+可直接安装：
 
 ```bash
 cargo install gmail-auto-label
