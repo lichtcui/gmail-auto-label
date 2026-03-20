@@ -22,14 +22,20 @@ fn join_output_reader(
 ) -> Result<Vec<u8>> {
     handle
         .join()
-        .map_err(|_| anyhow!("{stream_name} 读取线程异常退出"))?
-        .with_context(|| format!("读取 {stream_name} 输出失败"))
+        .map_err(|_| anyhow!("{stream_name} reader thread exited unexpectedly"))?
+        .with_context(|| format!("Failed to read {stream_name} output"))
 }
 
 fn run_cmd_with_timeout(mut cmd: Command, timeout_secs: u64) -> Result<(i32, String, String)> {
     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-    let stdout = child.stdout.take().context("无法获取子进程 stdout 管道")?;
-    let stderr = child.stderr.take().context("无法获取子进程 stderr 管道")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("Failed to capture child process stdout pipe")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("Failed to capture child process stderr pipe")?;
     let stdout_handle = spawn_output_reader(stdout);
     let stderr_handle = spawn_output_reader(stderr);
 
@@ -41,7 +47,7 @@ fn run_cmd_with_timeout(mut cmd: Command, timeout_secs: u64) -> Result<(i32, Str
             let _ = child.wait();
             let _ = stdout_handle.join();
             let _ = stderr_handle.join();
-            bail!("命令超时（{}s）", timeout_secs);
+            bail!("Command timed out ({}s)", timeout_secs);
         }
     };
 
@@ -80,7 +86,7 @@ mod tests {
         cmd.args(["-c", "sleep 2"]);
 
         let err = run_cmd_with_timeout(cmd, 1).expect_err("command should time out");
-        assert!(err.to_string().contains("命令超时"));
+        assert!(err.to_string().contains("Command timed out"));
     }
 }
 

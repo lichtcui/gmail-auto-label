@@ -18,7 +18,7 @@ This is the primary documentation.
 - Codex fallback for uncached emails, then persist extracted rules for later reuse
 - Auto-create missing Gmail labels and apply labels in batches
 - Optional archive step (remove `INBOX`) after labeling, with `--keep-inbox` support
-- Label compression when active labels exceed the limit (public control is `--max-labels`, merge target defaults to `其他通知`)
+- Label compression when active labels exceed the limit (public control is `--max-labels`, merge target defaults to `others`)
 - Gmail rate-limit handling with automatic retry and exponential backoff
 - Dry-run mode for safe preview without write operations
 
