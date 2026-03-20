@@ -1,13 +1,7 @@
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use chrono::Local;
-
 use crate::models::CacheData;
-
-pub(crate) fn now_str() -> String {
-    Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
-}
 
 pub(crate) fn now_ts() -> i64 {
     SystemTime::now()
@@ -17,7 +11,7 @@ pub(crate) fn now_ts() -> i64 {
 }
 
 pub(crate) fn log(msg: &str) {
-    println!("[{}] {}", now_str(), msg);
+    println!("{msg}");
 }
 
 pub(crate) fn auto_codex_workers(limit: usize) -> usize {

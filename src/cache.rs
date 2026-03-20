@@ -53,7 +53,7 @@ pub(crate) fn load_cache(path: &str) -> CacheData {
         Ok(raw) => raw,
         Err(err) => {
             log(&format!(
-                "WARN_LOAD_CACHE: 读取缓存失败，已忽略 {}: {}",
+                "WARN_LOAD_CACHE: failed to read cache, ignored {}: {}",
                 p.display(),
                 err
             ));
@@ -64,7 +64,7 @@ pub(crate) fn load_cache(path: &str) -> CacheData {
         Ok(cache) => cache,
         Err(err) => {
             log(&format!(
-                "WARN_LOAD_CACHE: 解析缓存失败，已忽略 {}: {}",
+                "WARN_LOAD_CACHE: failed to parse cache, ignored {}: {}",
                 p.display(),
                 err
             ));

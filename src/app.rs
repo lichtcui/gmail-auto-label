@@ -210,7 +210,7 @@ fn collect_threads(
             grouped.entry(label.clone()).or_default().push(t.id.clone());
             processed_ids.push(t.id.clone());
             log(&format!(
-                "分类: 线程={} 标签={} 来源={} 总结=自定义规则命中",
+                "CLASSIFY: thread={} label={} source={} summary=custom_rule_hit",
                 t.id, label, source
             ));
         } else if let Some((label, source)) = classify_from_cache_with_indexes(
@@ -225,7 +225,7 @@ fn collect_threads(
             grouped.entry(label.clone()).or_default().push(t.id.clone());
             processed_ids.push(t.id.clone());
             log(&format!(
-                "分类: 线程={} 标签={} 来源={} 总结=缓存命中",
+                "CLASSIFY: thread={} label={} source={} summary=cache_hit",
                 t.id, label, source
             ));
         } else {
@@ -253,7 +253,7 @@ fn run_codex_for_jobs<D: AppDeps>(
     }
 
     log(&format!(
-        "缓存未命中 {} 封，使用 {} 并发调用 Codex...",
+        "CACHE_MISS: {} threads, calling Codex with {} workers...",
         codex_jobs.len(),
         effective_workers
     ));
@@ -302,12 +302,13 @@ fn run_codex_for_jobs<D: AppDeps>(
         let (label, source, summary) =
             classify_with_codex_result(&job.sender, &job.subject, &job.snippet, cache, &result);
         if source == "codex:error" && label == "待分类" {
-            let hint = codex_error_hint(&summary).unwrap_or("请检查 codex 环境后重试。");
+            let hint = codex_error_hint(&summary)
+                .unwrap_or("Please check the Codex environment and retry.");
             if matches!(summary.as_str(), "codex_not_found" | "codex_non_zero_exit") {
                 codex_setup_failures += 1;
             }
             log(&format!(
-                "分类失败: 线程={}，原因={}。{} 已跳过打标，等待下轮重试。",
+                "CLASSIFY_FAILED: thread={} reason={}. {} Skipped labeling and will retry next round.",
                 job.id, summary, hint
             ));
             codex_failures += 1;
@@ -320,7 +321,7 @@ fn run_codex_for_jobs<D: AppDeps>(
             .push(job.id.clone());
         processed_ids.push(job.id.clone());
         log(&format!(
-            "分类: 线程={} 标签={} 来源={} 总结={}",
+            "CLASSIFY: thread={} label={} source={} summary={}",
             job.id, label, source, summary
         ));
     }
@@ -406,7 +407,7 @@ fn filter_recently_processed_keep_inbox_threads(
 
     if skipped > 0 {
         log(&format!(
-            "KEEP_INBOX_SKIP: 跳过 {} 封已处理且内容未变化的线程",
+            "KEEP_INBOX_SKIP: skipped {} processed threads with unchanged content",
             skipped
         ));
     }
@@ -457,12 +458,14 @@ fn process_once_with_deps<D: AppDeps>(
 ) -> std::result::Result<(String, RoundMetrics), DynErr> {
     let pending_threads = deps.fetch_pending(args.limit, &args.account)?;
     if pending_threads.is_empty() {
-        log("DONE_NO_PENDING: 没有待整理邮件，任务结束。");
+        log("DONE_NO_PENDING: no pending emails, run finished.");
         return Ok(("done".to_string(), RoundMetrics::default()));
     }
     let threads = filter_recently_processed_keep_inbox_threads(args, cache, pending_threads);
     if threads.is_empty() {
-        log("IDLE_NO_ELIGIBLE: 当前仅命中已处理且内容未变化的线程，等待下轮。");
+        log(
+            "IDLE_NO_ELIGIBLE: only already-processed unchanged threads matched; waiting for next round.",
+        );
         return Ok(("idle".to_string(), RoundMetrics::default()));
     }
 
@@ -507,7 +510,7 @@ fn process_once_with_deps<D: AppDeps>(
         .map(|(k, n)| format!("{}:{}", k, n))
         .collect::<Vec<_>>()
         .join(" | ");
-    log(&format!("本轮完成: 总计={} | {}", total, summary));
+    log(&format!("ROUND_DONE: total={} | {}", total, summary));
 
     Ok(("processed".to_string(), metrics))
 }
@@ -587,16 +590,18 @@ pub(crate) fn run() -> Result<()> {
     };
     if !custom_label_rules.is_empty() {
         log(&format!(
-            "已加载 {} 条自定义标签规则",
+            "Loaded {} custom label rules",
             custom_label_rules.len()
         ));
     }
 
     let effective_workers = auto_codex_workers(args.limit);
-    log(&format!("Codex 并发设置: {}", effective_workers));
+    log(&format!("Codex worker count: {}", effective_workers));
     let mut codex_pool: Option<ThreadPool> = None;
     let mut codex_checked = false;
-    log("冷启动优化: 已启用 Codex 预检与线程池懒加载（仅在缓存未命中时触发）");
+    log(
+        "Cold-start optimization enabled: Codex precheck and lazy thread pool init (triggered only on cache miss)",
+    );
     let baseline_write_options = GmailWriteOptions::default();
     let mut write_tuner = AdaptiveWriteTuner::new(baseline_write_options);
 
@@ -646,10 +651,13 @@ pub(crate) fn run() -> Result<()> {
             Ok(v) => v,
             Err(e) => match e {
                 AppError::RateLimit(msg) => {
-                    log(&format!("RATE_LIMIT: 本轮跳过，等待下轮。详情: {}", msg));
+                    log(&format!(
+                        "RATE_LIMIT: skipped this round, waiting for next round. details: {}",
+                        msg
+                    ));
                     write_tuner.on_rate_limit();
                     log(&format!(
-                        "ADAPTIVE_TUNING: 限流后调整写入参数 batch_size={} retries={} backoff_secs={}",
+                        "ADAPTIVE_TUNING: write params adjusted after rate limit batch_size={} retries={} backoff_secs={}",
                         write_tuner.current.batch_size,
                         write_tuner.current.batch_retries,
                         write_tuner.current.batch_retry_backoff_secs
@@ -677,7 +685,7 @@ pub(crate) fn run() -> Result<()> {
                 round_started.elapsed().as_millis()
             ));
             log(&format!(
-                "ADAPTIVE_TUNING: 当前写入参数 batch_size={} retries={} backoff_secs={}",
+                "ADAPTIVE_TUNING: current write params batch_size={} retries={} backoff_secs={}",
                 write_tuner.current.batch_size,
                 write_tuner.current.batch_retries,
                 write_tuner.current.batch_retry_backoff_secs
@@ -703,7 +711,10 @@ pub(crate) fn run() -> Result<()> {
             .watch_interval_secs()
             .expect("watch interval should exist when continuing");
 
-        log(&format!("休眠 {} 秒后继续...", interval_secs));
+        log(&format!(
+            "Sleeping {} seconds before next round...",
+            interval_secs
+        ));
         thread::sleep(Duration::from_secs(interval_secs));
     }
 

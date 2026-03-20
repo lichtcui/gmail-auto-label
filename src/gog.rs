@@ -71,16 +71,17 @@ pub(crate) fn run_gog_with_runner<R: CommandRunner>(
                 let msg = e.to_string();
                 if msg.contains("No such file or directory") {
                     return Err(AppError::Command(
-                        "未找到 `gog` 命令，请先安装并完成登录。".to_string(),
+                        "`gog` command not found. Please install it and complete login first."
+                            .to_string(),
                     ));
                 }
                 if msg.contains("命令超时") {
                     return Err(AppError::Command(format!(
-                        "命令超时（{}s）",
+                        "Command timed out ({}s)",
                         GOG_TIMEOUT_SECONDS
                     )));
                 }
-                return Err(AppError::Command(format!("执行 `gog` 命令失败: {}", msg)));
+                return Err(AppError::Command(format!("Failed to run `gog`: {}", msg)));
             }
         };
 
@@ -90,7 +91,7 @@ pub(crate) fn run_gog_with_runner<R: CommandRunner>(
             if attempt < GOG_RATE_LIMIT_MAX_RETRIES {
                 let sleep_secs = rate_limit_backoff_secs(attempt);
                 log(&format!(
-                    "Gmail 限流，{} 秒后重试（{}/{}）: {}",
+                    "Gmail rate limited, retrying in {} seconds ({}/{}): {}",
                     sleep_secs,
                     attempt + 1,
                     GOG_RATE_LIMIT_MAX_RETRIES + 1,
@@ -104,7 +105,7 @@ pub(crate) fn run_gog_with_runner<R: CommandRunner>(
 
         if code != 0 {
             return Err(AppError::Command(format!(
-                "命令失败: {}\n{}",
+                "Command failed: {}\n{}",
                 display,
                 merged.trim()
             )));
@@ -116,7 +117,7 @@ pub(crate) fn run_gog_with_runner<R: CommandRunner>(
 
         return serde_json::from_str::<Value>(out.trim()).map_err(|_| {
             AppError::Parse(format!(
-                "JSON 解析失败:\n{}",
+                "Failed to parse JSON:\n{}",
                 out.chars().take(500).collect::<String>()
             ))
         });
@@ -176,7 +177,7 @@ pub(crate) fn ensure_label(
         return Ok(());
     }
     if dry_run {
-        log(&format!("[dry-run] 将创建标签: {label}"));
+        log(&format!("[dry-run] Would create label: {label}"));
         existing_labels.insert(label.to_string());
         return Ok(());
     }
@@ -187,7 +188,7 @@ pub(crate) fn ensure_label(
         .collect::<Vec<_>>();
     run_gog(&args, account, true)?;
     existing_labels.insert(label.to_string());
-    log(&format!("已创建标签: {label}"));
+    log(&format!("Created label: {label}"));
     Ok(())
 }
 
@@ -268,7 +269,7 @@ pub(crate) fn apply_labels_with_runner_and_options<R: CommandRunner>(
         }
         if dry_run {
             log(&format!(
-                "[dry-run] 标签={}，数量={}，线程={:?}",
+                "[dry-run] label={}, count={}, threads={:?}",
                 label,
                 ids.len(),
                 ids
@@ -289,7 +290,7 @@ pub(crate) fn apply_labels_with_runner_and_options<R: CommandRunner>(
             run_gog_batch_with_retry(runner, &args, account, write_options)?;
             total_applied += chunk.len();
         }
-        log(&format!("已打标签: {} -> {} 封", label, total_applied));
+        log(&format!("Labeled: {} -> {} threads", label, total_applied));
     }
     Ok(())
 }
@@ -321,7 +322,7 @@ pub(crate) fn archive_threads_with_runner_and_options<R: CommandRunner>(
     }
     if dry_run {
         log(&format!(
-            "[dry-run] 将归档线程: 数量={}，线程={:?}",
+            "[dry-run] Would archive threads: count={}, threads={:?}",
             thread_ids.len(),
             thread_ids
         ));
@@ -339,7 +340,7 @@ pub(crate) fn archive_threads_with_runner_and_options<R: CommandRunner>(
         run_gog_batch_with_retry(runner, &args, account, write_options)?;
     }
     log(&format!(
-        "已归档线程（移出收件箱）: {} 封",
+        "Archived threads (removed from inbox): {}",
         thread_ids.len()
     ));
     Ok(())
@@ -360,7 +361,7 @@ fn run_gog_batch_with_retry<R: CommandRunner>(
                 if attempt < write_options.batch_retries {
                     let backoff = write_options.batch_retry_backoff_secs * (attempt as u64 + 1);
                     log(&format!(
-                        "Gmail 批处理失败，{} 秒后重试（{}/{}）",
+                        "Gmail batch failed, retrying in {} seconds ({}/{})",
                         backoff,
                         attempt + 1,
                         write_options.batch_retries + 1
@@ -370,7 +371,7 @@ fn run_gog_batch_with_retry<R: CommandRunner>(
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| AppError::Command("Gmail 批处理失败".to_string())))
+    Err(last_err.unwrap_or_else(|| AppError::Command("Gmail batch failed".to_string())))
 }
 
 #[cfg(test)]

@@ -200,12 +200,12 @@ pub(crate) fn codex_analyze_email_with_runner<R: CommandRunner>(
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("No such file or directory") {
-                return fallback("codex_not_found", "命令不存在");
+                return fallback("codex_not_found", "command_not_found");
             }
             if msg.contains("超时") {
-                return fallback("codex_timeout", "超时兜底");
+                return fallback("codex_timeout", "timeout_fallback");
             }
-            return fallback("codex_exec_error", "执行异常");
+            return fallback("codex_exec_error", "execution_error");
         }
     };
 
@@ -217,23 +217,23 @@ pub(crate) fn codex_analyze_email_with_runner<R: CommandRunner>(
                 stderr.chars().take(500).collect::<String>()
             ));
         }
-        return fallback("codex_non_zero_exit", "返回码异常");
+        return fallback("codex_non_zero_exit", "non_zero_exit");
     }
 
     let trimmed = out.trim();
     if trimmed.is_empty() {
-        return fallback("codex_empty_output", "空输出");
+        return fallback("codex_empty_output", "empty_output");
     }
 
     let v: Value = match serde_json::from_str(trimmed) {
         Ok(v) => v,
-        Err(_) => return fallback("codex_invalid_json", "输出不是合法 JSON"),
+        Err(_) => return fallback("codex_invalid_json", "output_not_valid_json"),
     };
     let label = normalize_label(v.get("label").and_then(Value::as_str).unwrap_or("待分类"));
     let summary = v
         .get("summary")
         .and_then(Value::as_str)
-        .unwrap_or("无总结")
+        .unwrap_or("no_summary")
         .trim()
         .to_string();
     let rule = v
@@ -245,7 +245,7 @@ pub(crate) fn codex_analyze_email_with_runner<R: CommandRunner>(
         ok: true,
         label,
         summary: if summary.is_empty() {
-            "无总结".to_string()
+            "no_summary".to_string()
         } else {
             summary
         },
@@ -255,7 +255,7 @@ pub(crate) fn codex_analyze_email_with_runner<R: CommandRunner>(
 
 pub(crate) fn upsert_rule(cache: &mut CacheData, label: &str, rule_input: &RuleInput) -> String {
     let description = if rule_input.description.trim().is_empty() {
-        "无描述".to_string()
+        "no_description".to_string()
     } else {
         rule_input.description.trim().to_string()
     };
@@ -311,7 +311,7 @@ pub(crate) fn classify_with_codex_result(
 ) -> (String, String, String) {
     let label = normalize_label(&result.label);
     let summary = if result.summary.trim().is_empty() {
-        "无总结".to_string()
+        "no_summary".to_string()
     } else {
         result.summary.trim().to_string()
     };
@@ -372,7 +372,7 @@ pub(crate) fn compress_labels_if_needed(
 
     if !merged_from.is_empty() {
         log(&format!(
-            "标签压缩: 超过 {} 个，已合并 {} 个标签 -> {}",
+            "LABEL_COMPRESSION: exceeded {}, merged {} labels -> {}",
             max_active_labels,
             merged_from.len(),
             target
@@ -410,15 +410,17 @@ pub(crate) fn ensure_codex_command_available(codex_cmd: &str) -> Result<()> {
 
 pub(crate) fn codex_error_hint(summary: &str) -> Option<&'static str> {
     match summary {
-        "codex_not_found" => {
-            Some("未找到 codex 命令。请安装 codex，或通过 `--codex-cmd` 指向正确可执行命令。")
-        }
-        "codex_non_zero_exit" => {
-            Some("codex 返回非 0。请先单独执行一次 `codex exec \"test\"` 检查认证/权限和环境。")
-        }
-        "codex_timeout" => Some("codex 超时。请检查网络与模型响应，或降低并发后重试。"),
+        "codex_not_found" => Some(
+            "Codex command not found. Install Codex, or set a valid executable via `--codex-cmd`.",
+        ),
+        "codex_non_zero_exit" => Some(
+            "Codex returned a non-zero exit code. Run `codex exec \"test\"` once to verify auth/permissions and environment.",
+        ),
+        "codex_timeout" => Some(
+            "Codex timed out. Check network/model responsiveness, or lower concurrency and retry.",
+        ),
         "codex_invalid_json" => {
-            Some("codex 输出不是 JSON。请检查 `--codex-cmd` 是否被包裹了额外输出。")
+            Some("Codex output is not valid JSON. Check whether `--codex-cmd` adds extra output.")
         }
         _ => None,
     }
