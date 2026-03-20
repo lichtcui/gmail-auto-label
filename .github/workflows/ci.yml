@@ -48,9 +48,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cargo audit
-        uses: rustsec/audit-check@v2
+        uses: actions-rust-lang/audit@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          createIssues: false
 
   notify:
     name: Notify Failure
