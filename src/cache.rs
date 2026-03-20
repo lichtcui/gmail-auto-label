@@ -79,15 +79,18 @@ pub(crate) fn load_cache(path: &str) -> CacheData {
 pub(crate) fn load_custom_label_rules(path: &str) -> Result<Vec<CustomLabelRule>> {
     let p = Path::new(path);
     let raw = fs::read_to_string(p)
-        .with_context(|| format!("读取自定义标签文件失败: {}", p.display()))?;
+        .with_context(|| format!("Failed to read custom label file: {}", p.display()))?;
     let mut rules = serde_json::from_str::<Vec<CustomLabelRule>>(&raw)
-        .with_context(|| format!("解析自定义标签文件失败: {}", p.display()))?;
+        .with_context(|| format!("Failed to parse custom label file: {}", p.display()))?;
 
     for (idx, rule) in rules.iter_mut().enumerate() {
         let raw_label = rule.label.trim().to_string();
         let normalized_label = normalize_label(&raw_label);
         if raw_label.is_empty() {
-            bail!("第 {} 条自定义标签规则缺少非空 label", idx + 1);
+            bail!(
+                "Custom label rule #{} is missing a non-empty label",
+                idx + 1
+            );
         }
 
         rule.label = normalized_label;
@@ -96,7 +99,7 @@ pub(crate) fn load_custom_label_rules(path: &str) -> Result<Vec<CustomLabelRule>
 
         if rule.include_keywords.is_empty() {
             bail!(
-                "第 {} 条自定义标签规则至少需要 1 个 include_keywords",
+                "Custom label rule #{} must provide at least one include_keywords item",
                 idx + 1
             );
         }
@@ -109,20 +112,25 @@ pub(crate) fn save_cache(path: &str, cache: &CacheData) -> Result<()> {
     let p = Path::new(path);
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent)
-            .with_context(|| format!("创建缓存目录失败: {}", parent.display()))?;
+            .with_context(|| format!("Failed to create cache directory: {}", parent.display()))?;
     }
     let body = serde_json::to_vec_pretty(cache)?;
     let tmp = temp_cache_path(p);
     {
         let mut file = fs::File::create(&tmp)
-            .with_context(|| format!("创建缓存临时文件失败: {}", tmp.display()))?;
+            .with_context(|| format!("Failed to create cache temp file: {}", tmp.display()))?;
         file.write_all(&body)
-            .with_context(|| format!("写缓存临时文件失败: {}", tmp.display()))?;
+            .with_context(|| format!("Failed to write cache temp file: {}", tmp.display()))?;
         file.sync_all()
-            .with_context(|| format!("同步缓存临时文件失败: {}", tmp.display()))?;
+            .with_context(|| format!("Failed to sync cache temp file: {}", tmp.display()))?;
     }
-    fs::rename(&tmp, p)
-        .with_context(|| format!("替换缓存文件失败: {} -> {}", tmp.display(), p.display()))
+    fs::rename(&tmp, p).with_context(|| {
+        format!(
+            "Failed to replace cache file: {} -> {}",
+            tmp.display(),
+            p.display()
+        )
+    })
 }
 
 pub(crate) fn cache_fingerprint(cache: &CacheData) -> Result<String> {
@@ -162,13 +170,13 @@ pub(crate) fn apply_feedback_from_file(
     }
 
     let raw = fs::read_to_string(path)
-        .with_context(|| format!("读取反馈文件失败: {}", path.display()))?;
+        .with_context(|| format!("Failed to read feedback file: {}", path.display()))?;
     if raw.trim().is_empty() {
         return Ok(FeedbackApplySummary::default());
     }
 
     let entries = serde_json::from_str::<Vec<FeedbackEntry>>(&raw)
-        .with_context(|| format!("解析反馈文件失败: {}", path.display()))?;
+        .with_context(|| format!("Failed to parse feedback file: {}", path.display()))?;
 
     let mut good_counts: HashMap<String, u32> = HashMap::new();
     let mut bad_counts: HashMap<String, u32> = HashMap::new();
@@ -252,7 +260,7 @@ pub(crate) fn apply_feedback_from_file(
         }
     }
 
-    fs::write(path, "[]").with_context(|| format!("重置反馈文件失败: {}", path.display()))?;
+    fs::write(path, "[]").with_context(|| format!("Failed to reset feedback file: {}", path.display()))?;
 
     Ok(FeedbackApplySummary {
         total_events: entries.len(),
@@ -275,7 +283,7 @@ pub(crate) fn prune_cache(
 
     cache
         .memos
-        .retain(|_, memo| now - memo.ts <= ttl_seconds && normalize_label(&memo.label) != "待分类");
+        .retain(|_, memo| now - memo.ts <= ttl_seconds && normalize_label(&memo.label) != "uncategorized");
 
     cache
         .processed_threads
@@ -306,7 +314,7 @@ pub(crate) fn prune_cache(
 
     cache.rules.retain(|r| {
         now - r.updated_at <= ttl_seconds
-            && normalize_label(&r.label) != "待分类"
+            && normalize_label(&r.label) != "uncategorized"
             && r.include_keywords.iter().any(|x| !x.trim().is_empty())
     });
     cache.rules.sort_by(|a, b| {

@@ -75,7 +75,7 @@ pub(crate) fn run_gog_with_runner<R: CommandRunner>(
                             .to_string(),
                     ));
                 }
-                if msg.contains("命令超时") {
+                if msg.contains("Command timed out") {
                     return Err(AppError::Command(format!(
                         "Command timed out ({}s)",
                         GOG_TIMEOUT_SECONDS

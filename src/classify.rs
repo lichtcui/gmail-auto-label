@@ -164,7 +164,7 @@ pub(crate) fn codex_analyze_email_with_runner<R: CommandRunner>(
     codex_cmd: &str,
 ) -> CodexClassify {
     let prompt = format!(
-        "你是邮件分类与规则抽取器。\n任务：根据邮件信息输出一个标签，并给出可复用的判定方式。\n输出必须是严格 JSON，不要输出任何额外文本。\nJSON 格式：\n{{\n  \"label\": \"标签名\",\n  \"summary\": \"一句话总结\",\n  \"rule\": {{\n    \"description\": \"该标签判定方式\",\n    \"include_keywords\": [\"关键词1\", \"关键词2\"],\n    \"exclude_keywords\": [\"排除词1\"]\n  }}\n}}\n要求：\n1. 标签尽量简洁（2-8字），面向 Gmail 打标签。\n2. include_keywords 至少提供 1 个，且应便于后续文本匹配。\n3. 如果邮件内容不足，仍需给出最合理标签和可执行规则。\n\n发件人: {}\n主题: {}\n摘要: {}\n",
+        "You are an email classification and rule extraction assistant.\nTask: classify the email into one label and provide a reusable rule.\nOutput must be strict JSON only, with no extra text.\nJSON format:\n{{\n  \"label\": \"label_name\",\n  \"summary\": \"one_sentence_summary\",\n  \"rule\": {{\n    \"description\": \"how this label is determined\",\n    \"include_keywords\": [\"keyword1\", \"keyword2\"],\n    \"exclude_keywords\": [\"exclude1\"]\n  }}\n}}\nRequirements:\n1. Keep label concise (about 2-8 words), suitable for Gmail labels.\n2. include_keywords must contain at least one item and should be useful for future text matching.\n3. If content is limited, still provide the most reasonable label and an actionable rule.\n\nSender: {}\nSubject: {}\nSnippet: {}\n",
         sender, subject, snippet
     );
 
@@ -186,7 +186,7 @@ pub(crate) fn codex_analyze_email_with_runner<R: CommandRunner>(
 
     let fallback = |summary: &str, description: &str| CodexClassify {
         ok: false,
-        label: "待分类".to_string(),
+        label: "uncategorized".to_string(),
         summary: summary.to_string(),
         rule: RuleInput {
             description: description.to_string(),
@@ -202,7 +202,7 @@ pub(crate) fn codex_analyze_email_with_runner<R: CommandRunner>(
             if msg.contains("No such file or directory") {
                 return fallback("codex_not_found", "command_not_found");
             }
-            if msg.contains("超时") {
+            if msg.contains("Command timed out") {
                 return fallback("codex_timeout", "timeout_fallback");
             }
             return fallback("codex_exec_error", "execution_error");
@@ -229,7 +229,7 @@ pub(crate) fn codex_analyze_email_with_runner<R: CommandRunner>(
         Ok(v) => v,
         Err(_) => return fallback("codex_invalid_json", "output_not_valid_json"),
     };
-    let label = normalize_label(v.get("label").and_then(Value::as_str).unwrap_or("待分类"));
+    let label = normalize_label(v.get("label").and_then(Value::as_str).unwrap_or("uncategorized"));
     let summary = v
         .get("summary")
         .and_then(Value::as_str)
@@ -346,7 +346,7 @@ pub(crate) fn compress_labels_if_needed(
     let mut scores: HashMap<String, i64> = HashMap::new();
     for r in &cache.rules {
         let label = normalize_label(&r.label);
-        if label == "待分类" {
+        if label == "uncategorized" {
             continue;
         }
         let final_label = resolve_label_alias(&label, cache);
@@ -381,9 +381,9 @@ pub(crate) fn compress_labels_if_needed(
 }
 
 pub(crate) fn extract_cmd_binary(cmd: &str) -> Result<String> {
-    let parts = shell_words::split(cmd).map_err(|e| anyhow!("命令解析失败: {e}"))?;
+    let parts = shell_words::split(cmd).map_err(|e| anyhow!("Failed to parse command: {e}"))?;
     if parts.is_empty() {
-        bail!("命令为空");
+        bail!("Command is empty");
     }
     Ok(parts[0].clone())
 }
@@ -399,12 +399,12 @@ pub(crate) fn ensure_codex_command_available(codex_cmd: &str) -> Result<()> {
     match status {
         Ok(_) => Ok(()),
         Err(e) if e.kind() == ErrorKind::NotFound => {
-            bail!("未找到可执行文件: `{binary}`");
+            bail!("Executable not found: `{binary}`");
         }
         Err(e) if e.kind() == ErrorKind::PermissionDenied => {
-            bail!("命令无执行权限: `{binary}`");
+            bail!("No execute permission for command: `{binary}`");
         }
-        Err(e) => bail!("命令检查失败: {e}"),
+        Err(e) => bail!("Failed to validate command: {e}"),
     }
 }
 

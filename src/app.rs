@@ -273,10 +273,12 @@ fn run_codex_for_jobs<D: AppDeps>(
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(effective_workers)
                     .build()
-                    .context("创建 Codex 线程池失败")?,
+                    .context("Failed to create Codex thread pool")?,
             );
         }
-        let pool = codex_pool.as_ref().context("Codex 线程池未初始化")?;
+        let pool = codex_pool
+            .as_ref()
+            .context("Codex thread pool is not initialized")?;
         pool.install(|| {
             codex_jobs
                 .into_par_iter()
@@ -301,7 +303,7 @@ fn run_codex_for_jobs<D: AppDeps>(
     for (job, result) in results {
         let (label, source, summary) =
             classify_with_codex_result(&job.sender, &job.subject, &job.snippet, cache, &result);
-        if source == "codex:error" && label == "待分类" {
+        if source == "codex:error" && label == "uncategorized" {
             let hint = codex_error_hint(&summary)
                 .unwrap_or("Please check the Codex environment and retry.");
             if matches!(summary.as_str(), "codex_not_found" | "codex_non_zero_exit") {
@@ -328,7 +330,7 @@ fn run_codex_for_jobs<D: AppDeps>(
 
     if total_results > 0 && codex_setup_failures == total_results {
         return Err(AppError::Config(
-            "Codex 配置不可用：本轮所有未命中缓存邮件都因 codex 配置问题失败。请先修复 codex 后重试。"
+            "Codex configuration is unavailable: all cache-miss emails in this round failed due to Codex setup issues. Please fix Codex and retry."
                 .to_string(),
         ));
     }
@@ -517,16 +519,16 @@ fn process_once_with_deps<D: AppDeps>(
 
 fn validate_args(args: &Args) -> Result<()> {
     if args.limit == 0 {
-        bail!("--limit 必须大于 0");
+        bail!("--limit must be greater than 0");
     }
     if args.watch == Some(0) {
-        bail!("--watch 必须大于 0");
+        bail!("--watch must be greater than 0");
     }
     if args.r#loop && args.interval == 0 {
-        bail!("--interval 必须大于 0");
+        bail!("--interval must be greater than 0");
     }
     if args.max_labels < 2 {
-        bail!("--max-labels 必须大于等于 2");
+        bail!("--max-labels must be at least 2");
     }
     Ok(())
 }
@@ -538,44 +540,44 @@ fn should_continue_after_round(args: &Args, _state: &str) -> bool {
 pub(crate) fn build_gog_setup_error(raw_error: &str, account: &Option<String>) -> AppError {
     let account_hint = account
         .as_ref()
-        .map(|a| format!("当前传入账号: `{a}`\n"))
+        .map(|a| format!("Provided account: `{a}`\n"))
         .unwrap_or_default();
     AppError::Config(format!(
-        "gog 配置检查失败。\n\
-         原始错误: {raw_error}\n\n\
-         排查建议:\n\
-         1. 确认已安装 gog，并可执行 `gog --help`\n\
-         2. 执行 `gog auth login` 完成登录\n\
-         3. 执行 `gog auth status` 检查认证状态\n\
-         4. 执行 `gog gmail labels list --no-input --json` 验证 Gmail 访问\n\
+        "gog configuration check failed.\n\
+         Raw error: {raw_error}\n\n\
+         Suggested checks:\n\
+         1. Ensure `gog` is installed and `gog --help` works\n\
+         2. Run `gog auth login` to sign in\n\
+         3. Run `gog auth status` to verify auth state\n\
+         4. Run `gog gmail labels list --no-input --json` to verify Gmail access\n\
          {account_hint}\
-         5. 如使用多账号，运行时加 `--account <name>` 指定账号"
+         5. If using multiple accounts, pass `--account <name>` at runtime"
     ))
 }
 
 pub(crate) fn build_codex_setup_error(raw_error: &str, codex_cmd: &str) -> AppError {
     AppError::Config(format!(
-        "Codex 配置检查失败。\n\
-         原始错误: {raw_error}\n\
-         当前 --codex-cmd: `{codex_cmd}`\n\n\
-         排查建议:\n\
-         1. 确认可执行 `codex --help` 或你自定义命令的 `--help`\n\
-         2. 若命令不存在，安装/修正 PATH，或通过 `--codex-cmd` 指定正确命令\n\
-         3. 如需登录，先执行对应登录步骤后再运行本工具"
+        "Codex configuration check failed.\n\
+         Raw error: {raw_error}\n\
+         Current --codex-cmd: `{codex_cmd}`\n\n\
+         Suggested checks:\n\
+         1. Ensure `codex --help` works, or run `--help` for your custom command\n\
+         2. If the command is missing, install it/fix PATH, or set a valid command via `--codex-cmd`\n\
+         3. If login is required, complete login first and rerun this tool"
     ))
 }
 
 pub(crate) fn build_custom_labels_setup_error(raw_error: &str, path: &str) -> AppError {
     AppError::Config(format!(
-        "自定义标签配置检查失败。\n\
-         原始错误: {raw_error}\n\
-         当前 --custom-labels-file: `{path}`\n\n\
-         排查建议:\n\
-         1. 确认文件存在且可读\n\
-         2. 确认文件内容是 JSON 数组\n\
-         3. 每条规则必须包含非空 `label`\n\
-         4. 每条规则至少提供 1 个 `include_keywords`\n\
-         5. 示例: [{{\"label\":\"重要客户\",\"include_keywords\":[\"vip\",\"invoice\"],\"exclude_keywords\":[\"spam\"]}}]"
+        "Custom label configuration check failed.\n\
+         Raw error: {raw_error}\n\
+         Current --custom-labels-file: `{path}`\n\n\
+         Suggested checks:\n\
+         1. Ensure the file exists and is readable\n\
+         2. Ensure the file content is a JSON array\n\
+         3. Each rule must include a non-empty `label`\n\
+         4. Each rule must provide at least one `include_keywords` item\n\
+         5. Example: [{{\"label\":\"Important Client\",\"include_keywords\":[\"vip\",\"invoice\"],\"exclude_keywords\":[\"spam\"]}}]"
     ))
 }
 
@@ -842,7 +844,7 @@ mod tests {
     #[test]
     fn test_normalize_label() {
         assert_eq!(normalize_label("  账单   通知 "), "账单 通知");
-        assert_eq!(normalize_label(""), "待分类");
+        assert_eq!(normalize_label(""), "uncategorized");
     }
 
     #[test]
@@ -868,7 +870,7 @@ mod tests {
     #[test]
     fn test_gog_setup_error_contains_fix_steps() {
         let err = build_gog_setup_error("mock error", &Some("work".to_string())).to_string();
-        assert!(err.contains("gog 配置检查失败"));
+        assert!(err.contains("gog configuration check failed"));
         assert!(err.contains("gog auth login"));
         assert!(err.contains("--account <name>"));
     }
@@ -876,7 +878,7 @@ mod tests {
     #[test]
     fn test_codex_setup_error_contains_fix_steps() {
         let err = build_codex_setup_error("not found", "codex exec").to_string();
-        assert!(err.contains("Codex 配置检查失败"));
+        assert!(err.contains("Codex configuration check failed"));
         assert!(err.contains("codex --help"));
         assert!(err.contains("--codex-cmd"));
     }
@@ -885,9 +887,9 @@ mod tests {
     fn test_custom_labels_setup_error_contains_fix_steps() {
         let err =
             build_custom_labels_setup_error("invalid json", "/tmp/custom-labels.json").to_string();
-        assert!(err.contains("自定义标签配置检查失败"));
+        assert!(err.contains("Custom label configuration check failed"));
         assert!(err.contains("--custom-labels-file"));
-        assert!(err.contains("JSON 数组"));
+        assert!(err.contains("JSON array"));
     }
 
     #[test]
@@ -1129,7 +1131,7 @@ mod tests {
             }],
             codex_result: CodexClassify {
                 ok: false,
-                label: "待分类".to_string(),
+                label: "uncategorized".to_string(),
                 summary: "codex_timeout".to_string(),
                 rule: RuleInput::default(),
             },

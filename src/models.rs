@@ -9,7 +9,7 @@ pub(crate) const DEFAULT_CACHE_TTL_HOURS: i64 = 24 * 14;
 pub(crate) const DEFAULT_CACHE_MAX_RULES: usize = 500;
 pub(crate) const DEFAULT_CACHE_MAX_MEMOS: usize = 5000;
 pub(crate) const DEFAULT_MAX_ACTIVE_LABELS: usize = 10;
-pub(crate) const DEFAULT_MERGED_LABEL: &str = "其他通知";
+pub(crate) const DEFAULT_MERGED_LABEL: &str = "others";
 pub(crate) const DEFAULT_GMAIL_BATCH_SIZE: usize = 100;
 pub(crate) const DEFAULT_GMAIL_BATCH_RETRIES: u32 = 2;
 pub(crate) const DEFAULT_GMAIL_BATCH_RETRY_BACKOFF_SECS: u64 = 1;
@@ -20,7 +20,7 @@ pub(crate) const DEFAULT_FEEDBACK_MAX_AGE_HOURS: i64 = 24 * 14;
 pub(crate) const DEFAULT_FEEDBACK_MAX_APPLIED_IDS: usize = 10000;
 
 #[derive(Parser, Debug, Clone)]
-#[command(about = "Gmail 自动分类打标签脚本（缓存优先 + Codex 分析）")]
+#[command(about = "Automatic Gmail labeling tool (cache-first + Codex fallback)")]
 pub(crate) struct Args {
     #[arg(long, default_value_t = 20)]
     pub(crate) limit: usize,

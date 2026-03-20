@@ -26,7 +26,7 @@ pub(crate) fn normalize_label(label: &str) -> String {
     let cleaned = label.split_whitespace().collect::<Vec<_>>().join(" ");
     let clipped: String = cleaned.chars().take(80).collect();
     if clipped.is_empty() {
-        "待分类".to_string()
+        "uncategorized".to_string()
     } else {
         clipped
     }
