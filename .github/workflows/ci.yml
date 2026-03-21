@@ -105,9 +105,9 @@ jobs:
       - name: Warn when Gmail secrets are missing
         if: ${{ steps.meta.outputs.should_notify == 'true' }}
         env:
-          GMAIL_USERNAME: ${{ secrets.LICHT_GMAIL_USERNAME }}
-          GMAIL_APP_PASSWORD: ${{ secrets.LICHT_GMAIL_APP_PASSWORD }}
-          ALERT_EMAIL_TO: ${{ secrets.LICHT_ALERT_EMAIL_TO }}
+          GMAIL_USERNAME: ${{ secrets.GMAIL_USERNAME }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
         run: |
           missing=""
           [ -z "$GMAIL_USERNAME" ] && missing="$missing LICHT_GMAIL_USERNAME"
@@ -121,9 +121,9 @@ jobs:
         id: validate_gmail
         if: ${{ steps.meta.outputs.should_notify == 'true' }}
         env:
-          GMAIL_USERNAME: ${{ secrets.LICHT_GMAIL_USERNAME }}
-          GMAIL_APP_PASSWORD: ${{ secrets.LICHT_GMAIL_APP_PASSWORD }}
-          ALERT_EMAIL_TO: ${{ secrets.LICHT_ALERT_EMAIL_TO }}
+          GMAIL_USERNAME: ${{ secrets.GMAIL_USERNAME }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
         run: |
           valid="true"
           if [ -z "$GMAIL_USERNAME" ] || [ -z "$GMAIL_APP_PASSWORD" ] || [ -z "$ALERT_EMAIL_TO" ]; then
@@ -146,9 +146,9 @@ jobs:
       - name: Send Gmail notification
         if: ${{ steps.meta.outputs.should_notify == 'true' && steps.validate_gmail.outputs.credentials_valid == 'true' && env.GMAIL_USERNAME != '' && env.GMAIL_APP_PASSWORD != '' && env.ALERT_EMAIL_TO != '' }}
         env:
-          GMAIL_USERNAME: ${{ secrets.LICHT_GMAIL_USERNAME }}
-          GMAIL_APP_PASSWORD: ${{ secrets.LICHT_GMAIL_APP_PASSWORD }}
-          ALERT_EMAIL_TO: ${{ secrets.LICHT_ALERT_EMAIL_TO }}
+          GMAIL_USERNAME: ${{ secrets.GMAIL_USERNAME }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
