@@ -229,7 +229,11 @@ pub(crate) fn codex_analyze_email_with_runner<R: CommandRunner>(
         Ok(v) => v,
         Err(_) => return fallback("codex_invalid_json", "output_not_valid_json"),
     };
-    let label = normalize_label(v.get("label").and_then(Value::as_str).unwrap_or("uncategorized"));
+    let label = normalize_label(
+        v.get("label")
+            .and_then(Value::as_str)
+            .unwrap_or("uncategorized"),
+    );
     let summary = v
         .get("summary")
         .and_then(Value::as_str)

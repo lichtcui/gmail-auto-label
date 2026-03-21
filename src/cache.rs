@@ -260,7 +260,8 @@ pub(crate) fn apply_feedback_from_file(
         }
     }
 
-    fs::write(path, "[]").with_context(|| format!("Failed to reset feedback file: {}", path.display()))?;
+    fs::write(path, "[]")
+        .with_context(|| format!("Failed to reset feedback file: {}", path.display()))?;
 
     Ok(FeedbackApplySummary {
         total_events: entries.len(),
@@ -281,9 +282,9 @@ pub(crate) fn prune_cache(
     let now = now_ts();
     let ttl_seconds = ttl_hours * 3600;
 
-    cache
-        .memos
-        .retain(|_, memo| now - memo.ts <= ttl_seconds && normalize_label(&memo.label) != "uncategorized");
+    cache.memos.retain(|_, memo| {
+        now - memo.ts <= ttl_seconds && normalize_label(&memo.label) != "uncategorized"
+    });
 
     cache
         .processed_threads
