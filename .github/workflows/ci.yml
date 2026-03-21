@@ -20,6 +20,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.86.0
           components: rustfmt, clippy
 
       - name: Cache cargo artifacts
@@ -46,6 +47,8 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.86.0
 
       - name: Cargo audit
         uses: actions-rust-lang/audit@v1
