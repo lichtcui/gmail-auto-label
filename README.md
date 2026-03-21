@@ -100,7 +100,7 @@ cargo install gmail-auto-label
 Optional (pin a version):
 
 ```bash
-cargo install gmail-auto-label --version 0.1.2
+cargo install gmail-auto-label --version 0.1.3
 ```
 
 After installation, run the binary directly:

@@ -100,7 +100,7 @@ cargo install gmail-auto-label
 可选：指定版本安装
 
 ```bash
-cargo install gmail-auto-label --version 0.1.2
+cargo install gmail-auto-label --version 0.1.3
 ```
 
 安装后可直接执行命令：

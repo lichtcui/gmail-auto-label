@@ -1,6 +1,6 @@
 [package]
 name = "gmail-auto-label"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.85"
 description = "Automatic Gmail labeling tool powered by gog and codex"
@@ -11,6 +11,16 @@ homepage = "https://github.com/lichtcui/gmail-auto-label"
 repository = "https://github.com/lichtcui/gmail-auto-label"
 keywords = ["gmail", "automation", "cli", "email", "labeling"]
 categories = ["command-line-utilities", "email"]
+include = [
+    "src/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "README_ZH.md",
+    "LICENSE",
+    "rust-toolchain.toml",
+    "rustfmt.toml",
+]
 
 [package.metadata.docs.rs]
 all-features = true
