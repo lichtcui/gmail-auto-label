@@ -1024,14 +1024,26 @@ mod tests {
     fn test_compute_watch_sleep_secs_backoff_and_reset() {
         let base = 300u64;
         let mut idle_rounds = 0u32;
-        assert_eq!(compute_watch_sleep_secs(base, "idle", &mut idle_rounds), 600);
+        assert_eq!(
+            compute_watch_sleep_secs(base, "idle", &mut idle_rounds),
+            600
+        );
         assert_eq!(idle_rounds, 1);
-        assert_eq!(compute_watch_sleep_secs(base, "done", &mut idle_rounds), 1200);
+        assert_eq!(
+            compute_watch_sleep_secs(base, "done", &mut idle_rounds),
+            1200
+        );
         assert_eq!(idle_rounds, 2);
-        assert_eq!(compute_watch_sleep_secs(base, "idle", &mut idle_rounds), 2400);
+        assert_eq!(
+            compute_watch_sleep_secs(base, "idle", &mut idle_rounds),
+            2400
+        );
         assert_eq!(idle_rounds, 3);
         // capped by multiplier=8
-        assert_eq!(compute_watch_sleep_secs(base, "idle", &mut idle_rounds), 2400);
+        assert_eq!(
+            compute_watch_sleep_secs(base, "idle", &mut idle_rounds),
+            2400
+        );
         assert_eq!(idle_rounds, 4);
 
         assert_eq!(
@@ -1433,7 +1445,12 @@ mod tests {
         assert_eq!(metrics.total_threads, 0);
         assert_eq!(*deps.codex_calls.lock().expect("lock poisoned"), 0);
         assert!(deps.applied.lock().expect("lock poisoned").is_empty());
-        assert!(deps.remove_inbox_flags.lock().expect("lock poisoned").is_empty());
+        assert!(
+            deps.remove_inbox_flags
+                .lock()
+                .expect("lock poisoned")
+                .is_empty()
+        );
     }
 
     #[test]

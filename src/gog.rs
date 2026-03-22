@@ -413,8 +413,12 @@ mod tests {
 
     #[test]
     fn test_should_retry_batch_error() {
-        assert!(!should_retry_batch_error(&AppError::RateLimit("429".to_string())));
-        assert!(should_retry_batch_error(&AppError::Command("timeout".to_string())));
+        assert!(!should_retry_batch_error(&AppError::RateLimit(
+            "429".to_string()
+        )));
+        assert!(should_retry_batch_error(&AppError::Command(
+            "timeout".to_string()
+        )));
     }
 
     #[test]
@@ -478,5 +482,4 @@ mod tests {
         .expect("apply labels failed");
         assert_eq!(runner.call_count(), 3);
     }
-
 }
