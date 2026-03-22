@@ -19,7 +19,7 @@ This is the primary documentation.
 - Auto-create missing Gmail labels and apply labels in batches
 - Optional archive step (remove `INBOX`) after labeling, with `--keep-inbox` support
 - Label compression when active labels exceed the limit (public control is `--max-labels`, merge target defaults to `others`)
-- Gmail rate-limit handling with automatic retry and exponential backoff
+- Gmail rate-limit handling with automatic retry/backoff in single-pass mode, and no in-round retries in watch mode
 - Dry-run mode for safe preview without write operations
 
 ## Prerequisites
@@ -111,25 +111,26 @@ gmail-auto-label --help
 
 ## Common Usage
 
-1. Single pass (default: 20 threads):
+1. Single pass (default: 10 threads):
 
 ```bash
-gmail-auto-label --limit 20
+gmail-auto-label --limit 10
 ```
 
 2. Dry run (no write operations):
 
 ```bash
-gmail-auto-label --dry-run --limit 20
+gmail-auto-label --dry-run --limit 10
 ```
 
-3. Watch mode (every 5 minutes):
+3. Watch mode (base interval: every 5 minutes):
 
 ```bash
 gmail-auto-label --watch 300
 ```
 
-If a round finds no pending inbox threads, watch mode waits for the next interval instead of exiting.
+Watch mode uses adaptive idle backoff: when rounds stay idle, the next sleep interval grows up to 8x the base interval; once a round processes emails, it resets to the base interval.  
+In watch mode, Gmail API calls do not retry within the same round; failed calls are retried in the next round.
 
 4. Keep messages in inbox (label only, no archive):
 
@@ -145,8 +146,8 @@ gmail-auto-label --custom-labels-file ./custom-labels.json
 
 ## Key Options
 
-- `--limit`: max threads per run, default `20`
-- `--watch`: polling interval in seconds, for example `--watch 300`
+- `--limit`: max threads per run, default `10`
+- `--watch`: base polling interval in seconds (adaptive idle backoff may extend actual sleep), for example `--watch 300`
 - `--account`: gog account name
 - `--dry-run`: print actions only, no writes
 - `--custom-labels-file`: load custom label rules from a JSON file

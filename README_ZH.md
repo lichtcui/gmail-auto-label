@@ -19,7 +19,7 @@
 - 自动创建缺失标签，并按标签批量回写邮件线程
 - 支持打标后自动归档（移出 `INBOX`），也可用 `--keep-inbox` 保留收件箱
 - 活跃标签超限时自动压缩合并（公开参数为 `--max-labels`，默认合并到 `others`）
-- 内置 Gmail 限流处理（自动重试 + 指数退避）
+- 内置 Gmail 限流处理：单轮模式自动重试+退避，`--watch` 模式同一轮不重试
 - 支持 `--dry-run` 演练模式，预览动作但不写入
 
 ## 前置条件
@@ -111,25 +111,26 @@ gmail-auto-label --help
 
 ## 常用用法
 
-1. 单轮处理（默认 20 封）：
+1. 单轮处理（默认 10 封）：
 
 ```bash
-gmail-auto-label --limit 20
+gmail-auto-label --limit 10
 ```
 
 2. 演练模式（不落地写入）：
 
 ```bash
-gmail-auto-label --dry-run --limit 20
+gmail-auto-label --dry-run --limit 10
 ```
 
-3. 轮询模式（每 5 分钟一轮）：
+3. 轮询模式（基础间隔每 5 分钟一轮）：
 
 ```bash
 gmail-auto-label --watch 300
 ```
 
-若某一轮没有待处理邮件，轮询模式会等待下一次间隔继续执行，而不是直接退出。
+轮询模式带有空闲退避：连续空闲轮次会逐步拉长下一轮等待时间，最高可到基础间隔的 8 倍；一旦有邮件被处理会恢复到基础间隔。  
+在 `--watch` 模式下，Gmail API 调用在同一轮不做重试，失败后等待下一轮再尝试。
 
 4. 仅打标签，不归档（保留收件箱）：
 
@@ -145,8 +146,8 @@ gmail-auto-label --custom-labels-file ./custom-labels.json
 
 ## 关键参数
 
-- `--limit`：每轮最多处理数量，默认 `20`
-- `--watch`：按秒轮询，例如 `--watch 300`
+- `--limit`：每轮最多处理数量，默认 `10`
+- `--watch`：按秒设置基础轮询间隔（空闲退避可能延长实际等待），例如 `--watch 300`
 - `--account`：指定 gog 账号名
 - `--dry-run`：只打印操作，不执行写入
 - `--custom-labels-file`：从 JSON 文件加载自定义标签规则

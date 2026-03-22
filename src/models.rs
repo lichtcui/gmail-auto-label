@@ -22,7 +22,7 @@ pub(crate) const DEFAULT_FEEDBACK_MAX_APPLIED_IDS: usize = 10000;
 #[derive(Parser, Debug, Clone)]
 #[command(about = "Automatic Gmail labeling tool (cache-first + Codex fallback)")]
 pub(crate) struct Args {
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = 10)]
     pub(crate) limit: usize,
     #[arg(long, value_name = "SECS")]
     pub(crate) watch: Option<u64>,

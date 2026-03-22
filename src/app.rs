@@ -18,8 +18,8 @@ use crate::classify::{
 };
 use crate::errors::AppError;
 use crate::gog::{
-    GmailWriteOptions, apply_labels_with_options, archive_threads_with_options, ensure_label,
-    fetch_existing_labels, fetch_pending,
+    GmailWriteOptions, apply_labels_with_options, ensure_label, fetch_pending,
+    set_watch_no_retry_mode,
 };
 use crate::models::{
     Args, CacheData, CodexClassify, CustomLabelRule, DEFAULT_CACHE_MAX_MEMOS,
@@ -30,6 +30,7 @@ use crate::models::{
 use crate::utils::{auto_codex_workers, log, now_ts, resolve_label_alias};
 
 type DynErr = AppError;
+const MAX_WATCH_IDLE_BACKOFF_MULTIPLIER: u64 = 8;
 
 #[derive(Debug, Default, Clone)]
 struct RoundMetrics {
@@ -45,21 +46,25 @@ struct AdaptiveWriteTuner {
     current: GmailWriteOptions,
     baseline: GmailWriteOptions,
     consecutive_success: u32,
+    no_retry_mode: bool,
 }
 
 impl AdaptiveWriteTuner {
-    fn new(baseline: GmailWriteOptions) -> Self {
+    fn new(baseline: GmailWriteOptions, no_retry_mode: bool) -> Self {
         Self {
             current: baseline,
             baseline,
             consecutive_success: 0,
+            no_retry_mode,
         }
     }
 
     fn on_rate_limit(&mut self) {
         self.consecutive_success = 0;
         self.current.batch_size = std::cmp::max(10, self.current.batch_size / 2);
-        self.current.batch_retries = std::cmp::min(self.current.batch_retries + 1, 6);
+        if !self.no_retry_mode {
+            self.current.batch_retries = std::cmp::min(self.current.batch_retries + 1, 6);
+        }
         self.current.batch_retry_backoff_secs =
             std::cmp::min(self.current.batch_retry_backoff_secs.saturating_mul(2), 30);
     }
@@ -74,7 +79,7 @@ impl AdaptiveWriteTuner {
             self.current.batch_size =
                 std::cmp::min(self.current.batch_size + 10, self.baseline.batch_size);
         }
-        if self.current.batch_retries > self.baseline.batch_retries {
+        if !self.no_retry_mode && self.current.batch_retries > self.baseline.batch_retries {
             self.current.batch_retries -= 1;
         }
         if self.current.batch_retry_backoff_secs > self.baseline.batch_retry_backoff_secs {
@@ -109,13 +114,7 @@ trait AppDeps: Sync {
         grouped: &HashMap<String, Vec<String>>,
         account: &Option<String>,
         dry_run: bool,
-        write_options: GmailWriteOptions,
-    ) -> std::result::Result<(), DynErr>;
-    fn archive_threads(
-        &self,
-        thread_ids: &[String],
-        account: &Option<String>,
-        dry_run: bool,
+        remove_inbox: bool,
         write_options: GmailWriteOptions,
     ) -> std::result::Result<(), DynErr>;
 }
@@ -161,19 +160,10 @@ impl AppDeps for RealDeps {
         grouped: &HashMap<String, Vec<String>>,
         account: &Option<String>,
         dry_run: bool,
+        remove_inbox: bool,
         write_options: GmailWriteOptions,
     ) -> std::result::Result<(), DynErr> {
-        apply_labels_with_options(grouped, account, dry_run, write_options)
-    }
-
-    fn archive_threads(
-        &self,
-        thread_ids: &[String],
-        account: &Option<String>,
-        dry_run: bool,
-        write_options: GmailWriteOptions,
-    ) -> std::result::Result<(), DynErr> {
-        archive_threads_with_options(thread_ids, account, dry_run, write_options)
+        apply_labels_with_options(grouped, account, dry_run, remove_inbox, write_options)
     }
 }
 
@@ -378,6 +368,37 @@ fn ensure_grouped_labels_exist<D: AppDeps>(
     Ok(())
 }
 
+fn seed_existing_labels(
+    cache: &CacheData,
+    custom_rules: &[CustomLabelRule],
+    merged_label: &str,
+) -> HashSet<String> {
+    let mut labels = HashSet::new();
+    for rule in &cache.rules {
+        let label = rule.label.trim();
+        if !label.is_empty() {
+            labels.insert(label.to_string());
+        }
+    }
+    for alias_target in cache.label_aliases.values() {
+        let label = alias_target.trim();
+        if !label.is_empty() {
+            labels.insert(label.to_string());
+        }
+    }
+    for rule in custom_rules {
+        let label = rule.label.trim();
+        if !label.is_empty() {
+            labels.insert(label.to_string());
+        }
+    }
+    let merged = merged_label.trim();
+    if !merged.is_empty() {
+        labels.insert(merged.to_string());
+    }
+    labels
+}
+
 fn filter_recently_processed_keep_inbox_threads(
     args: &Args,
     cache: &CacheData,
@@ -493,13 +514,17 @@ fn process_once_with_deps<D: AppDeps>(
     compress_labels_if_needed(cache, args.max_labels, &args.merged_label);
     let grouped = regroup_by_alias(grouped, cache, &custom_labels);
     ensure_grouped_labels_exist(deps, &grouped, args, existing_labels)?;
-    deps.apply_labels(&grouped, &args.account, args.dry_run, write_options)?;
+    deps.apply_labels(
+        &grouped,
+        &args.account,
+        args.dry_run,
+        !args.keep_inbox,
+        write_options,
+    )?;
     if args.keep_inbox {
         if !args.dry_run {
             remember_processed_keep_inbox_threads(cache, &threads, &processed_ids);
         }
-    } else {
-        deps.archive_threads(&processed_ids, &args.account, args.dry_run, write_options)?;
     }
 
     let total: usize = grouped.values().map(Vec::len).sum();
@@ -537,22 +562,23 @@ fn should_continue_after_round(args: &Args, _state: &str) -> bool {
     args.watch_interval_secs().is_some()
 }
 
-pub(crate) fn build_gog_setup_error(raw_error: &str, account: &Option<String>) -> AppError {
-    let account_hint = account
-        .as_ref()
-        .map(|a| format!("Provided account: `{a}`\n"))
-        .unwrap_or_default();
-    AppError::Config(format!(
-        "gog configuration check failed.\n\
-         Raw error: {raw_error}\n\n\
-         Suggested checks:\n\
-         1. Ensure `gog` is installed and `gog --help` works\n\
-         2. Run `gog auth login` to sign in\n\
-         3. Run `gog auth status` to verify auth state\n\
-         4. Run `gog gmail labels list --no-input --json` to verify Gmail access\n\
-         {account_hint}\
-         5. If using multiple accounts, pass `--account <name>` at runtime"
-    ))
+fn compute_watch_sleep_secs(base_secs: u64, state: &str, idle_rounds: &mut u32) -> u64 {
+    if state == "processed" {
+        *idle_rounds = 0;
+        return base_secs;
+    }
+
+    if state == "idle" || state == "done" {
+        *idle_rounds = idle_rounds.saturating_add(1);
+        let multiplier = std::cmp::min(
+            1u64 << std::cmp::min(*idle_rounds, 3),
+            MAX_WATCH_IDLE_BACKOFF_MULTIPLIER,
+        );
+        return base_secs.saturating_mul(multiplier);
+    }
+
+    *idle_rounds = 0;
+    base_secs
 }
 
 pub(crate) fn build_codex_setup_error(raw_error: &str, codex_cmd: &str) -> AppError {
@@ -598,14 +624,19 @@ pub(crate) fn run() -> Result<()> {
     }
 
     let effective_workers = auto_codex_workers(args.limit);
+    let watch_mode = args.watch_interval_secs().is_some();
+    set_watch_no_retry_mode(watch_mode);
     log(&format!("Codex worker count: {}", effective_workers));
     let mut codex_pool: Option<ThreadPool> = None;
     let mut codex_checked = false;
     log(
         "Cold-start optimization enabled: Codex precheck and lazy thread pool init (triggered only on cache miss)",
     );
-    let baseline_write_options = GmailWriteOptions::default();
-    let mut write_tuner = AdaptiveWriteTuner::new(baseline_write_options);
+    let mut baseline_write_options = GmailWriteOptions::default();
+    if watch_mode {
+        baseline_write_options.batch_retries = 0;
+    }
+    let mut write_tuner = AdaptiveWriteTuner::new(baseline_write_options, watch_mode);
 
     let mut cache = load_cache(&args.cache_file);
     prune_cache(
@@ -616,8 +647,10 @@ pub(crate) fn run() -> Result<()> {
     );
     let mut last_saved_fingerprint = cache_fingerprint(&cache)?;
 
-    let mut existing_labels = fetch_existing_labels(&args.account)
-        .map_err(|e| build_gog_setup_error(&e.to_string(), &args.account))?;
+    // Avoid startup `labels list` call to reduce Gmail API usage.
+    // Seed from local known labels, then create on demand when needed.
+    let mut existing_labels = seed_existing_labels(&cache, &custom_label_rules, &args.merged_label);
+    let mut idle_rounds: u32 = 0;
 
     loop {
         let feedback_summary = apply_feedback_from_file(
@@ -709,13 +742,14 @@ pub(crate) fn run() -> Result<()> {
         if !should_continue_after_round(&args, &state) {
             break;
         }
-        let interval_secs = args
+        let base_interval_secs = args
             .watch_interval_secs()
             .expect("watch interval should exist when continuing");
+        let interval_secs = compute_watch_sleep_secs(base_interval_secs, &state, &mut idle_rounds);
 
         log(&format!(
-            "Sleeping {} seconds before next round...",
-            interval_secs
+            "Sleeping {} seconds before next round... (base={} state={} idle_rounds={})",
+            interval_secs, base_interval_secs, state, idle_rounds
         ));
         thread::sleep(Duration::from_secs(interval_secs));
     }
@@ -740,7 +774,7 @@ mod tests {
         pending: Vec<ThreadInfo>,
         codex_result: CodexClassify,
         applied: Mutex<Vec<HashMap<String, Vec<String>>>>,
-        archived: Mutex<Vec<Vec<String>>>,
+        remove_inbox_flags: Mutex<Vec<bool>>,
         codex_calls: Mutex<usize>,
         codex_ready_calls: Mutex<usize>,
     }
@@ -788,26 +822,17 @@ mod tests {
             grouped: &HashMap<String, Vec<String>>,
             _account: &Option<String>,
             _dry_run: bool,
+            remove_inbox: bool,
             _write_options: GmailWriteOptions,
         ) -> std::result::Result<(), DynErr> {
             self.applied
                 .lock()
                 .expect("lock poisoned")
                 .push(grouped.clone());
-            Ok(())
-        }
-
-        fn archive_threads(
-            &self,
-            thread_ids: &[String],
-            _account: &Option<String>,
-            _dry_run: bool,
-            _write_options: GmailWriteOptions,
-        ) -> std::result::Result<(), DynErr> {
-            self.archived
+            self.remove_inbox_flags
                 .lock()
                 .expect("lock poisoned")
-                .push(thread_ids.to_vec());
+                .push(remove_inbox);
             Ok(())
         }
     }
@@ -868,14 +893,6 @@ mod tests {
     }
 
     #[test]
-    fn test_gog_setup_error_contains_fix_steps() {
-        let err = build_gog_setup_error("mock error", &Some("work".to_string())).to_string();
-        assert!(err.contains("gog configuration check failed"));
-        assert!(err.contains("gog auth login"));
-        assert!(err.contains("--account <name>"));
-    }
-
-    #[test]
     fn test_codex_setup_error_contains_fix_steps() {
         let err = build_codex_setup_error("not found", "codex exec").to_string();
         assert!(err.contains("Codex configuration check failed"));
@@ -918,7 +935,7 @@ mod tests {
                 },
             },
             applied: Mutex::new(Vec::new()),
-            archived: Mutex::new(Vec::new()),
+            remove_inbox_flags: Mutex::new(Vec::new()),
             codex_calls: Mutex::new(0),
             codex_ready_calls: Mutex::new(0),
         };
@@ -951,9 +968,9 @@ mod tests {
         let ids = grouped.get("账单").expect("expected 账单 label");
         assert_eq!(ids, &vec!["t1".to_string()]);
 
-        let archived = deps.archived.lock().expect("lock poisoned");
-        assert_eq!(archived.len(), 1);
-        assert_eq!(archived[0], vec!["t1".to_string()]);
+        let remove_inbox_flags = deps.remove_inbox_flags.lock().expect("lock poisoned");
+        assert_eq!(remove_inbox_flags.len(), 1);
+        assert!(remove_inbox_flags[0]);
         assert_eq!(*deps.codex_calls.lock().expect("lock poisoned"), 1);
         assert_eq!(*deps.codex_ready_calls.lock().expect("lock poisoned"), 1);
     }
@@ -965,7 +982,7 @@ mod tests {
             batch_retries: 2,
             batch_retry_backoff_secs: 1,
         };
-        let mut tuner = AdaptiveWriteTuner::new(base);
+        let mut tuner = AdaptiveWriteTuner::new(base, false);
 
         tuner.on_rate_limit();
         assert_eq!(tuner.current.batch_size, 50);
@@ -981,6 +998,18 @@ mod tests {
     }
 
     #[test]
+    fn test_adaptive_write_tuner_watch_mode_keeps_retries_zero() {
+        let base = GmailWriteOptions {
+            batch_size: 100,
+            batch_retries: 0,
+            batch_retry_backoff_secs: 1,
+        };
+        let mut tuner = AdaptiveWriteTuner::new(base, true);
+        tuner.on_rate_limit();
+        assert_eq!(tuner.current.batch_retries, 0);
+    }
+
+    #[test]
     fn test_should_continue_after_round_respects_watch_mode() {
         let single_run = make_args();
         assert!(!should_continue_after_round(&single_run, "processed"));
@@ -989,6 +1018,27 @@ mod tests {
         watch_args.watch = Some(300);
         assert!(should_continue_after_round(&watch_args, "done"));
         assert!(should_continue_after_round(&watch_args, "idle"));
+    }
+
+    #[test]
+    fn test_compute_watch_sleep_secs_backoff_and_reset() {
+        let base = 300u64;
+        let mut idle_rounds = 0u32;
+        assert_eq!(compute_watch_sleep_secs(base, "idle", &mut idle_rounds), 600);
+        assert_eq!(idle_rounds, 1);
+        assert_eq!(compute_watch_sleep_secs(base, "done", &mut idle_rounds), 1200);
+        assert_eq!(idle_rounds, 2);
+        assert_eq!(compute_watch_sleep_secs(base, "idle", &mut idle_rounds), 2400);
+        assert_eq!(idle_rounds, 3);
+        // capped by multiplier=8
+        assert_eq!(compute_watch_sleep_secs(base, "idle", &mut idle_rounds), 2400);
+        assert_eq!(idle_rounds, 4);
+
+        assert_eq!(
+            compute_watch_sleep_secs(base, "processed", &mut idle_rounds),
+            base
+        );
+        assert_eq!(idle_rounds, 0);
     }
 
     #[test]
@@ -1008,7 +1058,7 @@ mod tests {
                 rule: RuleInput::default(),
             },
             applied: Mutex::new(Vec::new()),
-            archived: Mutex::new(Vec::new()),
+            remove_inbox_flags: Mutex::new(Vec::new()),
             codex_calls: Mutex::new(0),
             codex_ready_calls: Mutex::new(0),
         };
@@ -1091,7 +1141,7 @@ mod tests {
                 rule: RuleInput::default(),
             },
             applied: Mutex::new(Vec::new()),
-            archived: Mutex::new(Vec::new()),
+            remove_inbox_flags: Mutex::new(Vec::new()),
             codex_calls: Mutex::new(0),
             codex_ready_calls: Mutex::new(0),
         };
@@ -1136,7 +1186,7 @@ mod tests {
                 rule: RuleInput::default(),
             },
             applied: Mutex::new(Vec::new()),
-            archived: Mutex::new(Vec::new()),
+            remove_inbox_flags: Mutex::new(Vec::new()),
             codex_calls: Mutex::new(0),
             codex_ready_calls: Mutex::new(0),
         };
@@ -1186,7 +1236,7 @@ mod tests {
                 },
             },
             applied: Mutex::new(Vec::new()),
-            archived: Mutex::new(Vec::new()),
+            remove_inbox_flags: Mutex::new(Vec::new()),
             codex_calls: Mutex::new(0),
             codex_ready_calls: Mutex::new(0),
         };
@@ -1260,7 +1310,7 @@ mod tests {
                 rule: RuleInput::default(),
             },
             applied: Mutex::new(Vec::new()),
-            archived: Mutex::new(Vec::new()),
+            remove_inbox_flags: Mutex::new(Vec::new()),
             codex_calls: Mutex::new(0),
             codex_ready_calls: Mutex::new(0),
         };
@@ -1346,7 +1396,7 @@ mod tests {
                 },
             },
             applied: Mutex::new(Vec::new()),
-            archived: Mutex::new(Vec::new()),
+            remove_inbox_flags: Mutex::new(Vec::new()),
             codex_calls: Mutex::new(0),
             codex_ready_calls: Mutex::new(0),
         };
@@ -1383,7 +1433,7 @@ mod tests {
         assert_eq!(metrics.total_threads, 0);
         assert_eq!(*deps.codex_calls.lock().expect("lock poisoned"), 0);
         assert!(deps.applied.lock().expect("lock poisoned").is_empty());
-        assert!(deps.archived.lock().expect("lock poisoned").is_empty());
+        assert!(deps.remove_inbox_flags.lock().expect("lock poisoned").is_empty());
     }
 
     #[test]
@@ -1407,7 +1457,7 @@ mod tests {
                 },
             },
             applied: Mutex::new(Vec::new()),
-            archived: Mutex::new(Vec::new()),
+            remove_inbox_flags: Mutex::new(Vec::new()),
             codex_calls: Mutex::new(0),
             codex_ready_calls: Mutex::new(0),
         };
@@ -1443,7 +1493,9 @@ mod tests {
         assert_eq!(state, "processed");
         assert_eq!(metrics.codex_success, 1);
         assert_eq!(*deps.codex_calls.lock().expect("lock poisoned"), 1);
-        assert!(deps.archived.lock().expect("lock poisoned").is_empty());
+        let remove_inbox_flags = deps.remove_inbox_flags.lock().expect("lock poisoned");
+        assert_eq!(remove_inbox_flags.len(), 1);
+        assert!(!remove_inbox_flags[0]);
         assert!(cache.processed_threads.contains_key("t-keep-change"));
         let saved = cache
             .processed_threads
