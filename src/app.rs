@@ -521,10 +521,8 @@ fn process_once_with_deps<D: AppDeps>(
         !args.keep_inbox,
         write_options,
     )?;
-    if args.keep_inbox {
-        if !args.dry_run {
-            remember_processed_keep_inbox_threads(cache, &threads, &processed_ids);
-        }
+    if args.keep_inbox && !args.dry_run {
+        remember_processed_keep_inbox_threads(cache, &threads, &processed_ids);
     }
 
     let total: usize = grouped.values().map(Vec::len).sum();
