@@ -4,12 +4,12 @@ use std::io::Write;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::models::{CACHE_VERSION, CacheData, CustomLabelRule, DEFAULT_FEEDBACK_MAX_APPLIED_IDS};
+use crate::models::{CACHE_VERSION, CacheData, DEFAULT_FEEDBACK_MAX_APPLIED_IDS};
 use crate::utils::{log, normalize_label, now_ts};
 
 fn sha256_hex(input: &str) -> String {
@@ -74,38 +74,6 @@ pub(crate) fn load_cache(path: &str) -> CacheData {
     cache.version = CACHE_VERSION.to_string();
     normalize_cache_rules(&mut cache);
     cache
-}
-
-pub(crate) fn load_custom_label_rules(path: &str) -> Result<Vec<CustomLabelRule>> {
-    let p = Path::new(path);
-    let raw = fs::read_to_string(p)
-        .with_context(|| format!("Failed to read custom label file: {}", p.display()))?;
-    let mut rules = serde_json::from_str::<Vec<CustomLabelRule>>(&raw)
-        .with_context(|| format!("Failed to parse custom label file: {}", p.display()))?;
-
-    for (idx, rule) in rules.iter_mut().enumerate() {
-        let raw_label = rule.label.trim().to_string();
-        let normalized_label = normalize_label(&raw_label);
-        if raw_label.is_empty() {
-            bail!(
-                "Custom label rule #{} is missing a non-empty label",
-                idx + 1
-            );
-        }
-
-        rule.label = normalized_label;
-        rule.include_keywords = normalize_keywords(&rule.include_keywords);
-        rule.exclude_keywords = normalize_keywords(&rule.exclude_keywords);
-
-        if rule.include_keywords.is_empty() {
-            bail!(
-                "Custom label rule #{} must provide at least one include_keywords item",
-                idx + 1
-            );
-        }
-    }
-
-    Ok(rules)
 }
 
 pub(crate) fn save_cache(path: &str, cache: &CacheData) -> Result<()> {
@@ -286,10 +254,6 @@ pub(crate) fn prune_cache(
         now - memo.ts <= ttl_seconds && normalize_label(&memo.label) != "uncategorized"
     });
 
-    cache
-        .processed_threads
-        .retain(|_, entry| now - entry.ts <= ttl_seconds && !entry.content_key.trim().is_empty());
-
     if cache.memos.len() > max_memos {
         let mut pairs: Vec<(String, i64)> =
             cache.memos.iter().map(|(k, v)| (k.clone(), v.ts)).collect();
@@ -297,19 +261,6 @@ pub(crate) fn prune_cache(
         let drop_count = cache.memos.len() - max_memos;
         for (k, _) in pairs.into_iter().take(drop_count) {
             cache.memos.remove(&k);
-        }
-    }
-
-    if cache.processed_threads.len() > max_memos {
-        let mut pairs: Vec<(String, i64)> = cache
-            .processed_threads
-            .iter()
-            .map(|(k, v)| (k.clone(), v.ts))
-            .collect();
-        pairs.sort_by_key(|(_, ts)| *ts);
-        let drop_count = cache.processed_threads.len() - max_memos;
-        for (k, _) in pairs.into_iter().take(drop_count) {
-            cache.processed_threads.remove(&k);
         }
     }
 
@@ -368,7 +319,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::models::{ProcessedThread, Rule};
+    use crate::models::Rule;
     use crate::utils::now_ts;
 
     fn tmp_feedback_file() -> String {
@@ -385,14 +336,6 @@ mod tests {
             .unwrap_or_default()
             .as_nanos();
         format!("/tmp/gmail_cache_test_{ts}.json")
-    }
-
-    fn tmp_custom_labels_file() -> String {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        format!("/tmp/gmail_custom_labels_test_{ts}.json")
     }
 
     #[test]
@@ -473,13 +416,6 @@ mod tests {
             include_keywords: vec![" invoice ".to_string()],
             ..Default::default()
         });
-        cache.processed_threads.insert(
-            "t1".to_string(),
-            ProcessedThread {
-                content_key: "memo:abc".to_string(),
-                ts: now_ts(),
-            },
-        );
 
         save_cache(&path, &cache).expect("save cache should succeed");
         let loaded = load_cache(&path);
@@ -490,7 +426,6 @@ mod tests {
             loaded.rules[0].include_keywords,
             vec!["invoice".to_string()]
         );
-        assert!(loaded.processed_threads.contains_key("t1"));
 
         let _ = fs::remove_file(&path);
     }
@@ -505,44 +440,6 @@ mod tests {
         assert_eq!(loaded.version, CACHE_VERSION);
         assert!(loaded.rules.is_empty());
         assert!(loaded.memos.is_empty());
-        assert!(loaded.processed_threads.is_empty());
-
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn test_load_custom_label_rules_normalizes_valid_file() {
-        let path = tmp_custom_labels_file();
-        fs::write(
-            &path,
-            r#"[{"label":" 重要客户 ","include_keywords":[" vip "," invoice "],"exclude_keywords":[" spam "]}]"#,
-        )
-        .expect("write custom labels");
-
-        let rules = load_custom_label_rules(&path).expect("custom rules should load");
-
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].label, "重要客户");
-        assert_eq!(
-            rules[0].include_keywords,
-            vec!["vip".to_string(), "invoice".to_string()]
-        );
-        assert_eq!(rules[0].exclude_keywords, vec!["spam".to_string()]);
-
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn test_load_custom_label_rules_rejects_rule_without_include_keywords() {
-        let path = tmp_custom_labels_file();
-        fs::write(
-            &path,
-            r#"[{"label":"重要客户","include_keywords":["   "],"exclude_keywords":[]}]"#,
-        )
-        .expect("write custom labels");
-
-        let err = load_custom_label_rules(&path).expect_err("custom rules should fail");
-        assert!(err.to_string().contains("include_keywords"));
 
         let _ = fs::remove_file(&path);
     }

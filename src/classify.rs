@@ -1,16 +1,11 @@
 use std::collections::HashMap;
-use std::io::ErrorKind;
-use std::process::{Command, Stdio};
 
-use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
 
 use crate::cache::{memo_key, rule_id};
-use crate::command::{CommandRunner, SystemCommandRunner};
-use crate::models::{CacheData, CodexClassify, CustomLabelRule, Memo, Rule, RuleInput};
+use crate::llm::{LlmConfig, call_chat};
+use crate::models::{CacheData, LlmClassify, Memo, Rule, RuleInput};
 use crate::utils::{log, normalize_label, now_ts, resolve_label_alias};
-
-const CODEX_TIMEOUT_SECONDS: u64 = 25;
 
 pub(crate) fn build_rule_priority_indexes(cache: &CacheData) -> Vec<usize> {
     let mut indexes = (0..cache.rules.len()).collect::<Vec<_>>();
@@ -62,27 +57,6 @@ fn keywords_match_text(
 
 fn rule_matches_text(rule: &Rule, text: &str) -> bool {
     keywords_match_text(&rule.include_keywords, &rule.exclude_keywords, text)
-}
-
-pub(crate) fn classify_with_custom_rules(
-    sender: &str,
-    subject: &str,
-    snippet: &str,
-    custom_rules: &[CustomLabelRule],
-) -> Option<(String, String)> {
-    if custom_rules.is_empty() {
-        return None;
-    }
-
-    let text = normalized_match_text(sender, subject, snippet);
-    for (idx, rule) in custom_rules.iter().enumerate() {
-        if !keywords_match_text(&rule.include_keywords, &rule.exclude_keywords, &text) {
-            continue;
-        }
-        return Some((rule.label.clone(), format!("custom:{}", idx + 1)));
-    }
-
-    None
 }
 
 #[cfg(test)]
@@ -147,44 +121,18 @@ pub(crate) fn classify_from_cache_with_indexes(
     None
 }
 
-pub(crate) fn codex_analyze_email(
+pub(crate) fn llm_classify_email(
     sender: &str,
     subject: &str,
     snippet: &str,
-    codex_cmd: &str,
-) -> CodexClassify {
-    codex_analyze_email_with_runner(&SystemCommandRunner, sender, subject, snippet, codex_cmd)
-}
-
-pub(crate) fn codex_analyze_email_with_runner<R: CommandRunner>(
-    runner: &R,
-    sender: &str,
-    subject: &str,
-    snippet: &str,
-    codex_cmd: &str,
-) -> CodexClassify {
+    llm_config: &LlmConfig,
+) -> LlmClassify {
     let prompt = format!(
         "You are an email classification and rule extraction assistant.\nTask: classify the email into one label and provide a reusable rule.\nOutput must be strict JSON only, with no extra text.\nJSON format:\n{{\n  \"label\": \"label_name\",\n  \"summary\": \"one_sentence_summary\",\n  \"rule\": {{\n    \"description\": \"how this label is determined\",\n    \"include_keywords\": [\"keyword1\", \"keyword2\"],\n    \"exclude_keywords\": [\"exclude1\"]\n  }}\n}}\nRequirements:\n1. Keep label concise (about 2-8 words), suitable for Gmail labels.\n2. include_keywords must contain at least one item and should be useful for future text matching.\n3. If content is limited, still provide the most reasonable label and an actionable rule.\n\nSender: {}\nSubject: {}\nSnippet: {}\n",
         sender, subject, snippet
     );
 
-    let mut parts = match shell_words::split(codex_cmd) {
-        Ok(p) if !p.is_empty() => p,
-        _ => vec!["codex".to_string(), "exec".to_string()],
-    };
-    if parts.len() >= 2
-        && parts[0] == "codex"
-        && parts[1] == "exec"
-        && !parts.iter().any(|x| x == "--skip-git-repo-check")
-    {
-        parts.push("--skip-git-repo-check".to_string());
-    }
-    parts.push(prompt);
-
-    let program = parts[0].clone();
-    let cmd_args = parts[1..].to_vec();
-
-    let fallback = |summary: &str, description: &str| CodexClassify {
+    let fallback = |summary: &str, description: &str| LlmClassify {
         ok: false,
         label: "uncategorized".to_string(),
         summary: summary.to_string(),
@@ -195,39 +143,27 @@ pub(crate) fn codex_analyze_email_with_runner<R: CommandRunner>(
         },
     };
 
-    let (code, out, err) = match runner.run(&program, &cmd_args, CODEX_TIMEOUT_SECONDS) {
-        Ok(v) => v,
+    let trimmed = match call_chat(&prompt, llm_config) {
+        Ok(t) => t,
         Err(e) => {
             let msg = e.to_string();
-            if msg.contains("No such file or directory") {
-                return fallback("codex_not_found", "command_not_found");
+            if msg.contains("timed out") {
+                return fallback("llm_timeout", "timeout_fallback");
             }
-            if msg.contains("Command timed out") {
-                return fallback("codex_timeout", "timeout_fallback");
+            if msg.contains("rate limit") || msg.contains("429") {
+                return fallback("llm_rate_limited", "rate_limit_fallback");
             }
-            return fallback("codex_exec_error", "execution_error");
+            return fallback("llm_error", "execution_error");
         }
     };
 
-    if code != 0 {
-        let stderr = err.trim();
-        if !stderr.is_empty() {
-            log(&format!(
-                "CODEX_STDERR: {}",
-                stderr.chars().take(500).collect::<String>()
-            ));
-        }
-        return fallback("codex_non_zero_exit", "non_zero_exit");
-    }
-
-    let trimmed = out.trim();
     if trimmed.is_empty() {
-        return fallback("codex_empty_output", "empty_output");
+        return fallback("llm_empty_output", "empty_output");
     }
 
-    let v: Value = match serde_json::from_str(trimmed) {
+    let v: Value = match serde_json::from_str(&trimmed) {
         Ok(v) => v,
-        Err(_) => return fallback("codex_invalid_json", "output_not_valid_json"),
+        Err(_) => return fallback("llm_invalid_json", "output_not_valid_json"),
     };
     let label = normalize_label(
         v.get("label")
@@ -245,7 +181,7 @@ pub(crate) fn codex_analyze_email_with_runner<R: CommandRunner>(
         .and_then(|r| serde_json::from_value::<RuleInput>(r.clone()).ok())
         .unwrap_or_default();
 
-    CodexClassify {
+    LlmClassify {
         ok: true,
         label,
         summary: if summary.is_empty() {
@@ -306,12 +242,12 @@ pub(crate) fn upsert_rule(cache: &mut CacheData, label: &str, rule_input: &RuleI
     rid
 }
 
-pub(crate) fn classify_with_codex_result(
+pub(crate) fn classify_with_llm_result(
     sender: &str,
     subject: &str,
     snippet: &str,
     cache: &mut CacheData,
-    result: &CodexClassify,
+    result: &LlmClassify,
 ) -> (String, String, String) {
     let label = normalize_label(&result.label);
     let summary = if result.summary.trim().is_empty() {
@@ -321,7 +257,7 @@ pub(crate) fn classify_with_codex_result(
     };
 
     if !result.ok {
-        return (label, "codex:error".to_string(), summary);
+        return (label, "llm:error".to_string(), summary);
     }
 
     let rid = upsert_rule(cache, &label, &result.rule);
@@ -337,7 +273,7 @@ pub(crate) fn classify_with_codex_result(
     let final_label = resolve_label_alias(&label, cache);
     (
         final_label,
-        format!("codex:{}", rid.chars().take(8).collect::<String>()),
+        format!("llm:{}", rid.chars().take(8).collect::<String>()),
         summary,
     )
 }
@@ -384,47 +320,14 @@ pub(crate) fn compress_labels_if_needed(
     }
 }
 
-pub(crate) fn extract_cmd_binary(cmd: &str) -> Result<String> {
-    let parts = shell_words::split(cmd).map_err(|e| anyhow!("Failed to parse command: {e}"))?;
-    if parts.is_empty() {
-        bail!("Command is empty");
-    }
-    Ok(parts[0].clone())
-}
-
-pub(crate) fn ensure_codex_command_available(codex_cmd: &str) -> Result<()> {
-    let binary = extract_cmd_binary(codex_cmd)?;
-    let status = Command::new(&binary)
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-
-    match status {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            bail!("Executable not found: `{binary}`");
-        }
-        Err(e) if e.kind() == ErrorKind::PermissionDenied => {
-            bail!("No execute permission for command: `{binary}`");
-        }
-        Err(e) => bail!("Failed to validate command: {e}"),
-    }
-}
-
-pub(crate) fn codex_error_hint(summary: &str) -> Option<&'static str> {
+pub(crate) fn llm_error_hint(summary: &str) -> Option<&'static str> {
     match summary {
-        "codex_not_found" => Some(
-            "Codex command not found. Install Codex, or set a valid executable via `--codex-cmd`.",
-        ),
-        "codex_non_zero_exit" => Some(
-            "Codex returned a non-zero exit code. Run `codex exec \"test\"` once to verify auth/permissions and environment.",
-        ),
-        "codex_timeout" => Some(
-            "Codex timed out. Check network/model responsiveness, or lower concurrency and retry.",
-        ),
-        "codex_invalid_json" => {
-            Some("Codex output is not valid JSON. Check whether `--codex-cmd` adds extra output.")
+        "llm_timeout" => {
+            Some("LLM API timed out. Check network connectivity and API responsiveness.")
+        }
+        "llm_rate_limited" => Some("LLM API rate limited. The system will back off and retry."),
+        "llm_invalid_json" => {
+            Some("LLM response is not valid JSON. The model may have returned extra text.")
         }
         _ => None,
     }
@@ -432,56 +335,57 @@ pub(crate) fn codex_error_hint(summary: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
-    use anyhow::Result as AnyResult;
-
     use super::*;
 
-    struct MockRunner {
-        outputs: Mutex<Vec<AnyResult<(i32, String, String)>>>,
-    }
-
-    impl MockRunner {
-        fn from(outputs: Vec<AnyResult<(i32, String, String)>>) -> Self {
-            Self {
-                outputs: Mutex::new(outputs),
-            }
-        }
-    }
-
-    impl CommandRunner for MockRunner {
-        fn run(
-            &self,
-            _program: &str,
-            _args: &[String],
-            _timeout_secs: u64,
-        ) -> AnyResult<(i32, String, String)> {
-            let mut guard = self.outputs.lock().expect("lock poisoned");
-            if guard.is_empty() {
-                return Ok((0, "{}".to_string(), String::new()));
-            }
-            guard.remove(0)
-        }
-    }
-
     #[test]
-    fn test_codex_analyze_email_with_runner_success() {
-        let runner = MockRunner::from(vec![Ok((
-            0,
-            r#"{"label":"账单","summary":"每月账单","rule":{"description":"账单邮件","include_keywords":["invoice"],"exclude_keywords":[]}}"#.to_string(),
-            String::new(),
-        ))]);
-        let out = codex_analyze_email_with_runner(
-            &runner,
+    fn test_classify_with_llm_result_parses_success() {
+        let mut cache = CacheData::default();
+        let result = LlmClassify {
+            ok: true,
+            label: "账单".to_string(),
+            summary: "每月账单提醒".to_string(),
+            rule: RuleInput {
+                description: "账单类邮件".to_string(),
+                include_keywords: vec!["invoice".to_string()],
+                exclude_keywords: vec![],
+            },
+        };
+        let (label, source, summary) = classify_with_llm_result(
             "billing@example.com",
             "invoice",
             "monthly invoice",
-            "codex exec",
+            &mut cache,
+            &result,
         );
-        assert!(out.ok);
-        assert_eq!(out.label, "账单");
-        assert_eq!(out.summary, "每月账单");
-        assert_eq!(out.rule.include_keywords, vec!["invoice".to_string()]);
+        assert_eq!(label, "账单");
+        assert_eq!(summary, "每月账单提醒");
+        assert!(source.starts_with("llm:"));
+        // A rule should have been upserted
+        assert_eq!(cache.rules.len(), 1);
+        assert_eq!(cache.rules[0].label, "账单");
+        // A memo should have been written
+        assert!(cache.memos.contains_key(&memo_key(
+            "billing@example.com",
+            "invoice",
+            "monthly invoice"
+        )));
+    }
+
+    #[test]
+    fn test_classify_with_llm_result_fallback_on_error() {
+        let mut cache = CacheData::default();
+        let result = LlmClassify {
+            ok: false,
+            label: "uncategorized".to_string(),
+            summary: "llm_timeout".to_string(),
+            rule: RuleInput::default(),
+        };
+        let (label, source, summary) =
+            classify_with_llm_result("x@example.com", "hello", "test", &mut cache, &result);
+        assert_eq!(label, "uncategorized");
+        assert_eq!(source, "llm:error");
+        assert_eq!(summary, "llm_timeout");
+        // No rule or memo should be added on error
+        assert!(cache.rules.is_empty());
     }
 }

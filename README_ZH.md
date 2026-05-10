@@ -5,7 +5,7 @@
 [![Crates.io](https://img.shields.io/crates/v/gmail-auto-label.svg)](https://crates.io/crates/gmail-auto-label)
 [![Crates.io](https://img.shields.io/crates/d/gmail-auto-label.svg)](https://crates.io/crates/gmail-auto-label)
 
-基于 `gog` + `codex` 的 Gmail 自动分类打标工具（Rust 版）。  
+基于 DeepSeek API 的 Gmail 自动分类打标工具（Rust 版）。  
 这是中文文档。
 
 🌐 Languages: [🇺🇸 English](README.md) · [🇨🇳 简体中文](README_ZH.md)
@@ -13,19 +13,19 @@
 ## 功能描述
 
 - 自动扫描收件箱线程，并按业务语义打 Gmail 标签
-- 支持可选的自定义标签规则，并且优先于缓存命中、学习规则和 Codex 分类
+- **两阶段工作流**：IMAP 同步 + LLM 总结 → 批量分类 + 打标签（避开 Gmail API 读取限流）
 - 缓存优先分类（记忆 + 可复用规则），减少重复调用大模型
-- 缓存未命中时调用 Codex 分类，并把规则回写到本地缓存
+- 缓存未命中时调用 LLM 分类，并把规则回写到本地缓存
 - 自动创建缺失标签，并按标签批量回写邮件线程
-- 支持打标后自动归档（移出 `INBOX`），也可用 `--keep-inbox` 保留收件箱
-- 活跃标签超限时自动压缩合并（公开参数为 `--max-labels`，默认合并到 `others`）
-- 内置 Gmail 限流处理：单轮模式自动重试+退避，`--watch` 模式同一轮不重试
-- 支持 `--dry-run` 演练模式，预览动作但不写入
+- 打标后自动归档（移出 `INBOX`）
+- 活跃标签超限时自动压缩合并（`--max-labels`，默认合并到 `others`）
+- 内置 Gmail 限流处理：自动重试+退避
+- 支持机器可读的 JSON 输出（`--output json`）
 
 ## 前置条件
 
-- 已安装并登录 `gog`
-- 已安装 `codex` 命令（默认使用 `codex exec`）
+- 已安装并登录 `gog`（用于 Gmail 写入操作）
+- DeepSeek API key（通过 `--api-key` 参数或 `DEEPSEEK_API_KEY` 环境变量设置）
 - 已安装 Rust 工具链
 
 ## gog 配置
@@ -97,68 +97,83 @@ cargo build --release
 cargo install gmail-auto-label
 ```
 
-可选：指定版本安装
-
-```bash
-cargo install gmail-auto-label --version 0.1.3
-```
-
 安装后可直接执行命令：
 
 ```bash
 gmail-auto-label --help
 ```
 
-## 常用用法
+## LLM 配置
 
-1. 单轮处理（默认 10 封）：
+设置 DeepSeek API key（默认模型为 `deepseek-v4-flash`）：
 
 ```bash
-gmail-auto-label --limit 10
+# 通过环境变量（推荐）
+export DEEPSEEK_API_KEY=sk-your-key-here
+
+# 或通过命令行参数
+gmail-auto-label --api-key sk-your-key-here
 ```
 
-2. 演练模式（不落地写入）：
+使用其他模型：
 
 ```bash
-gmail-auto-label --dry-run --limit 10
+gmail-auto-label --model deepseek-v4-pro
 ```
 
-3. 轮询模式（基础间隔每 5 分钟一轮）：
+## 使用方式
+
+### 两阶段工作流
+
+阶段 1 — 通过 IMAP 同步所有邮件并用 LLM 总结（零 Gmail API 读取调用）：
 
 ```bash
-gmail-auto-label --watch 300
+gmail-auto-label --sync --imap-user your@gmail.com --imap-pass your-app-password
 ```
 
-轮询模式带有空闲退避：连续空闲轮次会逐步拉长下一轮等待时间，最高可到基础间隔的 8 倍；一旦有邮件被处理会恢复到基础间隔。  
-在 `--watch` 模式下，Gmail API 调用在同一轮不做重试，失败后等待下一轮再尝试。
+> Gmail 应用专用密码在 https://myaccount.google.com/apppasswords 生成（需已开启两步验证）。
 
-4. 仅打标签，不归档（保留收件箱）：
+可选限制同步的邮件数量：
 
 ```bash
-gmail-auto-label --keep-inbox
+gmail-auto-label --sync --imap-user your@gmail.com --imap-pass xxxx --sync-max 5000
 ```
 
-5. 使用自定义标签规则：
+阶段 2 — 从缓存读取摘要进行分类并批量打标签：
 
 ```bash
-gmail-auto-label --custom-labels-file ./custom-labels.json
+gmail-auto-label --from-cache
+```
+
+该阶段仅调用 Gmail API 进行标签创建和修改（写入操作），完全绕过读取配额限制。
+
+机器可读的 JSON 输出：
+
+```bash
+gmail-auto-label --output json
 ```
 
 ## 关键参数
 
-- `--limit`：每轮最多处理数量，默认 `10`
-- `--watch`：按秒设置基础轮询间隔（空闲退避可能延长实际等待），例如 `--watch 300`
-- `--account`：指定 gog 账号名
-- `--dry-run`：只打印操作，不执行写入
-- `--custom-labels-file`：从 JSON 文件加载自定义标签规则
-- `--max-labels`：最大活跃标签数，默认 `10`
-- `--keep-inbox`：处理后不移出收件箱
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--account` | 指定 gog 账号名 | — |
+| `--api-key` | DeepSeek API key（或 `DEEPSEEK_API_KEY` 环境变量） | — |
+| `--model` | DeepSeek 模型名 | `deepseek-v4-flash` |
+| `--max-labels` | 最大活跃标签数 | `10` |
+| `--output` | 输出格式（`text` \| `json`） | `text` |
+| `--sync` | 运行 IMAP 同步阶段（拉取+总结） | — |
+| `--from-cache` | 从先前同步的缓存数据中处理 | — |
+| `--imap-user` | IMAP 用户名（邮箱地址） | — |
+| `--imap-pass` | IMAP 密码或应用专用密码 | — |
+| `--imap-host` | IMAP 服务器地址 | `imap.gmail.com` |
+| `--imap-port` | IMAP 端口 | `993` |
+| `--sync-max` | 最多同步的邮件数（0 = 不限） | `0` |
 
 ## 高级参数
 
 这些参数仍兼容保留，但默认隐藏，一般不需要手动设置：
 
-- `--codex-cmd`
 - `--cache-file`
 - `--merged-label`
 - 旧版兼容：`--loop` + `--interval` 仍可用，但推荐统一改成 `--watch`
@@ -180,34 +195,31 @@ gmail-auto-label --custom-labels-file ./custom-labels.json
 - `event_id` 需唯一，重复/回放事件会被跳过。
 - `ts` 为 Unix 秒时间戳，超过内置反馈时效的过期事件会被跳过。
 
-## 自定义标签规则
+## 工作原理
 
-使用 `--custom-labels-file <path>` 可以在每次运行开始前加载用户自定义的标签规则。匹配优先级如下：
+### 数据流（两阶段模式）
 
-1. 自定义标签规则
-2. Memo 缓存命中
-3. 学习得到的规则
-4. Codex 兜底分类
+```
+阶段 1: IMAP 同步 (--sync)
+  IMAP 收件箱 ──► 解析 MIME ──► 提取正文 ──► LLM 总结 ──► 本地缓存 (JSON)
 
-规则按文件顺序匹配，命中第一条就停止。自定义标签不会被反馈机制自动删除，也不会被学习标签压缩逻辑合并到默认归并标签。
-
-示例文件：
-
-```json
-[
-  {
-    "label": "重要客户",
-    "include_keywords": ["vip", "invoice"],
-    "exclude_keywords": ["spam"]
-  }
-]
+阶段 2: 从缓存处理 (--from-cache)
+  本地缓存 ──► 分类（缓存命中 → 学习规则 → LLM）──► 批量打标签
 ```
 
-校验规则：
-- 文件必须是可读取的 JSON
-- 顶层结构必须是数组
-- 每条规则必须包含非空 `label`
-- 每条规则至少包含 1 个非空 `include_keywords`
+阶段 2 完全读取本地缓存——零 Gmail API 读取调用。只有最终的标签写入步骤（通过 `gog gmail labels modify`）才会触及 Gmail API，读取配额全部留给写入操作。
+
+### 分类优先级
+
+1. 缓存 memo（精确匹配发件人+主题+摘要）
+2. 学习得到的关键词规则（按命中数排序）
+3. LLM 分类（DeepSeek API），自动提取规则回写
+
+### 限流处理
+
+- 读取操作（IMAP 同步，阶段 1）：零 Gmail API 调用
+- 写入操作（标签创建/修改，阶段 2）：自适应批次大小和重试/退避
+- LLM 调用：自动重试，指数退避（1s, 2s, 4s），仅限瞬时故障
 
 ## 查看帮助
 

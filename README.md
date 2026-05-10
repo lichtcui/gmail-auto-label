@@ -5,7 +5,7 @@
 [![Crates.io](https://img.shields.io/crates/v/gmail-auto-label.svg)](https://crates.io/crates/gmail-auto-label)
 [![Crates.io](https://img.shields.io/crates/d/gmail-auto-label.svg)](https://crates.io/crates/gmail-auto-label)
 
-An automatic Gmail labeling tool built with `gog` + `codex` (Rust version).  
+An automatic Gmail labeling tool powered by LLM (DeepSeek API).  
 This is the primary documentation.
 
 🌐 Languages: [🇺🇸 English](README.md) · [🇨🇳 简体中文](README_ZH.md)
@@ -13,19 +13,19 @@ This is the primary documentation.
 ## Features
 
 - Auto-scan inbox threads and classify emails into business-friendly labels
-- Optional custom label rules with higher priority than memoized, learned, and Codex-generated matches
+- **Two-phase workflow**: IMAP sync + LLM summarization → batch classification + label application (avoids Gmail API rate limits)
 - Cache-first classification (memo + reusable rules) to reduce repeated LLM calls
-- Codex fallback for uncached emails, then persist extracted rules for later reuse
+- LLM fallback for uncached emails, then persist extracted rules for later reuse
 - Auto-create missing Gmail labels and apply labels in batches
-- Optional archive step (remove `INBOX`) after labeling, with `--keep-inbox` support
-- Label compression when active labels exceed the limit (public control is `--max-labels`, merge target defaults to `others`)
-- Gmail rate-limit handling with automatic retry/backoff in single-pass mode, and no in-round retries in watch mode
-- Dry-run mode for safe preview without write operations
+- Automatic archive step (remove `INBOX`) after labeling
+- Label compression when active labels exceed the limit (`--max-labels`, merge target defaults to `others`)
+- Gmail rate-limit handling with automatic retry/backoff
+- Machine-readable JSON output (`--output json`)
 
 ## Prerequisites
 
-- `gog` is installed and authenticated
-- `codex` CLI is installed (default command: `codex exec`)
+- `gog` is installed and authenticated (for Gmail write operations)
+- DeepSeek API key (set via `--api-key` or `DEEPSEEK_API_KEY` env var)
 - Rust toolchain is installed
 
 ## gog Setup
@@ -97,68 +97,83 @@ Install with:
 cargo install gmail-auto-label
 ```
 
-Optional (pin a version):
-
-```bash
-cargo install gmail-auto-label --version 0.1.3
-```
-
 After installation, run the binary directly:
 
 ```bash
 gmail-auto-label --help
 ```
 
-## Common Usage
+## LLM Setup
 
-1. Single pass (default: 10 threads):
+Set your DeepSeek API key (the model defaults to `deepseek-v4-flash`):
 
 ```bash
-gmail-auto-label --limit 10
+# Via environment variable (recommended)
+export DEEPSEEK_API_KEY=sk-your-key-here
+
+# Or via CLI argument
+gmail-auto-label --api-key sk-your-key-here
 ```
 
-2. Dry run (no write operations):
+To use a different model:
 
 ```bash
-gmail-auto-label --dry-run --limit 10
+gmail-auto-label --model deepseek-v4-pro
 ```
 
-3. Watch mode (base interval: every 5 minutes):
+## Usage
+
+### Two-Phase Workflow
+
+Phase 1 — Sync all emails via IMAP and summarize via LLM (zero Gmail API reads):
 
 ```bash
-gmail-auto-label --watch 300
+gmail-auto-label --sync --imap-user your@gmail.com --imap-pass your-app-password
 ```
 
-Watch mode uses adaptive idle backoff: when rounds stay idle, the next sleep interval grows up to 8x the base interval; once a round processes emails, it resets to the base interval.  
-In watch mode, Gmail API calls do not retry within the same round; failed calls are retried in the next round.
+> Gmail app passwords are generated at https://myaccount.google.com/apppasswords (requires 2FA enabled).
 
-4. Keep messages in inbox (label only, no archive):
+Optionally limit the number of messages to sync:
 
 ```bash
-gmail-auto-label --keep-inbox
+gmail-auto-label --sync --imap-user your@gmail.com --imap-pass xxxx --sync-max 5000
 ```
 
-5. Use custom label rules:
+Phase 2 — Classify from cached summaries and batch-apply labels:
 
 ```bash
-gmail-auto-label --custom-labels-file ./custom-labels.json
+gmail-auto-label --from-cache
+```
+
+This phase only calls the Gmail API for label creation and modification (write operations), bypassing read quota entirely.
+
+Machine-readable JSON output:
+
+```bash
+gmail-auto-label --output json
 ```
 
 ## Key Options
 
-- `--limit`: max threads per run, default `10`
-- `--watch`: base polling interval in seconds (adaptive idle backoff may extend actual sleep), for example `--watch 300`
-- `--account`: gog account name
-- `--dry-run`: print actions only, no writes
-- `--custom-labels-file`: load custom label rules from a JSON file
-- `--max-labels`: max active labels, default `10`
-- `--keep-inbox`: do not remove processed threads from inbox
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--account` | gog account name | — |
+| `--api-key` | DeepSeek API key (or `DEEPSEEK_API_KEY` env) | — |
+| `--model` | DeepSeek model name | `deepseek-v4-flash` |
+| `--max-labels` | Max active labels before compression | `10` |
+| `--output` | Output format (`text` \| `json`) | `text` |
+| `--sync` | Run IMAP sync phase (fetch + summarize) | — |
+| `--from-cache` | Process from previously synced cache data | — |
+| `--imap-user` | IMAP username for sync mode | — |
+| `--imap-pass` | IMAP password or app password | — |
+| `--imap-host` | IMAP server hostname | `imap.gmail.com` |
+| `--imap-port` | IMAP server port | `993` |
+| `--sync-max` | Max messages to sync (0 = unlimited) | `0` |
 
 ## Advanced Options
 
 These flags remain supported for compatibility, but are hidden by default:
 
-- `--codex-cmd`
 - `--cache-file`
 - `--merged-label`
 - Legacy compatibility: `--loop` + `--interval` still work, but `--watch` is the preferred form
@@ -180,34 +195,31 @@ Notes:
 - `event_id` must be unique; duplicated/replayed events are skipped.
 - `ts` uses Unix seconds; stale events older than the built-in feedback retention window are skipped.
 
-## Custom Label Rules
+## How It Works
 
-Use `--custom-labels-file <path>` to load user-defined label rules before a run starts. Matching order is:
+### Data Flow (Two-Phase Mode)
 
-1. Custom label rules
-2. Memoized matches
-3. Learned rules
-4. Codex fallback
+```
+Phase 1: IMAP Sync (--sync)
+  IMAP inbox ──► parse MIME ──► extract body text ──► LLM summarize ──► cache (local JSON)
 
-Rules are evaluated in file order, first match wins. Custom labels are not auto-pruned by feedback and are not merged into the learned-label compression target.
-
-Example file:
-
-```json
-[
-  {
-    "label": "Important Client",
-    "include_keywords": ["vip", "invoice"],
-    "exclude_keywords": ["spam"]
-  }
-]
+Phase 2: Process from Cache (--from-cache)
+  cache ──► classify (cached memos → learned rules → LLM) ──► batch apply labels
 ```
 
-Validation rules:
-- File must be readable JSON
-- Top-level value must be an array
-- Each rule must include a non-empty `label`
-- Each rule must include at least one non-empty `include_keywords` value
+Phase 2 reads exclusively from the local cache — zero Gmail API read calls. Only the final label write step (via `gog gmail labels modify`) touches the Gmail API, which means the full read quota is available for write operations.
+
+### Classification Priority
+
+1. Cache memo (exact sender+subject+snippet match)
+2. Learned keyword rules (sorted by hit count)
+3. LLM classification (DeepSeek API) with automatic rule extraction
+
+### Rate Limiting
+
+- Read operations (IMAP sync, Phase 1): No Gmail API calls
+- Write operations (label create/modify, Phase 2): Uses Gmail API with adaptive batch sizing and retry/backoff
+- LLM calls: Automatic retry with exponential backoff (1s, 2s, 4s) for transient failures
 
 ## Help
 

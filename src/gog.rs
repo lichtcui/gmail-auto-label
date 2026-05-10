@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -7,18 +6,15 @@ use serde_json::{Value, json};
 
 use crate::command::{CommandRunner, SystemCommandRunner};
 use crate::errors::AppError;
-use crate::models::ThreadInfo;
 use crate::models::{
     DEFAULT_GMAIL_BATCH_RETRIES, DEFAULT_GMAIL_BATCH_RETRY_BACKOFF_SECS, DEFAULT_GMAIL_BATCH_SIZE,
 };
 use crate::utils::log;
 
-const SEARCH_QUERY: &str = "in:inbox";
 const GOG_TIMEOUT_SECONDS: u64 = 30;
 const GOG_RATE_LIMIT_MAX_RETRIES: u32 = 4;
 const GOG_RATE_LIMIT_BASE_BACKOFF_SECS: u64 = 2;
 const GOG_RATE_LIMIT_MAX_BACKOFF_SECS: u64 = 30;
-static WATCH_NO_RETRY_MODE: AtomicBool = AtomicBool::new(false);
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct GmailWriteOptions {
     pub(crate) batch_size: usize,
@@ -34,10 +30,6 @@ impl Default for GmailWriteOptions {
             batch_retry_backoff_secs: DEFAULT_GMAIL_BATCH_RETRY_BACKOFF_SECS,
         }
     }
-}
-
-pub(crate) fn set_watch_no_retry_mode(enabled: bool) {
-    WATCH_NO_RETRY_MODE.store(enabled, Ordering::Relaxed);
 }
 
 pub(crate) fn run_gog(
@@ -56,11 +48,7 @@ pub(crate) fn run_gog_with_runner<R: CommandRunner>(
 ) -> Result<Value, AppError> {
     let display = format!("gog {}", args.join(" "));
     let mut last_rate_limit_message = String::new();
-    let max_retries = if WATCH_NO_RETRY_MODE.load(Ordering::Relaxed) {
-        0
-    } else {
-        GOG_RATE_LIMIT_MAX_RETRIES
-    };
+    let max_retries = GOG_RATE_LIMIT_MAX_RETRIES;
 
     for attempt in 0..=max_retries {
         let mut cmd_args = Vec::new();
@@ -162,14 +150,8 @@ pub(crate) fn ensure_label(
     label: &str,
     existing_labels: &mut HashSet<String>,
     account: &Option<String>,
-    dry_run: bool,
 ) -> Result<(), AppError> {
     if existing_labels.contains(label) {
-        return Ok(());
-    }
-    if dry_run {
-        log(&format!("[dry-run] Would create label: {label}"));
-        existing_labels.insert(label.to_string());
         return Ok(());
     }
 
@@ -198,65 +180,15 @@ fn is_label_already_exists_error(raw: &str) -> bool {
         || msg.contains("duplicate")
 }
 
-pub(crate) fn fetch_pending(
-    limit: usize,
-    account: &Option<String>,
-) -> Result<Vec<ThreadInfo>, AppError> {
-    let args = vec!["gmail", "search", SEARCH_QUERY, "--max", &limit.to_string()]
-        .into_iter()
-        .map(String::from)
-        .collect::<Vec<_>>();
-    let data = run_gog(&args, account, true)?;
-    let mut threads = Vec::new();
-    if let Some(items) = data.get("threads").and_then(Value::as_array) {
-        for t in items {
-            let id = t
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            if id.is_empty() {
-                continue;
-            }
-            let sender = t
-                .get("from")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let subject = t
-                .get("subject")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let snippet = t
-                .get("snippet")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            threads.push(ThreadInfo {
-                id,
-                sender,
-                subject,
-                snippet,
-            });
-        }
-    }
-    Ok(threads)
-}
-
 pub(crate) fn apply_labels_with_options(
     grouped: &HashMap<String, Vec<String>>,
     account: &Option<String>,
-    dry_run: bool,
-    remove_inbox: bool,
     write_options: GmailWriteOptions,
 ) -> Result<(), AppError> {
     apply_labels_with_runner_and_options(
         &SystemCommandRunner,
         grouped,
         account,
-        dry_run,
-        remove_inbox,
         write_options,
     )
 }
@@ -265,8 +197,6 @@ pub(crate) fn apply_labels_with_runner_and_options<R: CommandRunner>(
     runner: &R,
     grouped: &HashMap<String, Vec<String>>,
     account: &Option<String>,
-    dry_run: bool,
-    remove_inbox: bool,
     write_options: GmailWriteOptions,
 ) -> Result<(), AppError> {
     let mut labels: Vec<String> = grouped.keys().cloned().collect();
@@ -274,15 +204,6 @@ pub(crate) fn apply_labels_with_runner_and_options<R: CommandRunner>(
     for label in labels {
         let ids = grouped.get(&label).cloned().unwrap_or_default();
         if ids.is_empty() {
-            continue;
-        }
-        if dry_run {
-            log(&format!(
-                "[dry-run] label={}, count={}, threads={:?}",
-                label,
-                ids.len(),
-                ids
-            ));
             continue;
         }
 
@@ -295,10 +216,8 @@ pub(crate) fn apply_labels_with_runner_and_options<R: CommandRunner>(
             args.extend(chunk.iter().cloned());
             args.push("--add".to_string());
             args.push(label.clone());
-            if remove_inbox {
-                args.push("--remove".to_string());
-                args.push("INBOX".to_string());
-            }
+            args.push("--remove".to_string());
+            args.push("INBOX".to_string());
 
             run_gog_batch_with_retry(runner, &args, account, write_options)?;
             total_applied += chunk.len();
@@ -340,7 +259,9 @@ fn run_gog_batch_with_retry<R: CommandRunner>(
 }
 
 fn should_retry_batch_error(err: &AppError) -> bool {
-    !matches!(err, AppError::RateLimit(_))
+    // RateLimit is handled by the caller, so don't retry here.
+    // Parse errors (invalid JSON from gog) are also permanent — retrying won't help.
+    matches!(err, AppError::Command(_))
 }
 
 #[cfg(test)]
@@ -419,25 +340,12 @@ mod tests {
         assert!(should_retry_batch_error(&AppError::Command(
             "timeout".to_string()
         )));
-    }
-
-    #[test]
-    fn test_watch_no_retry_mode_disables_rate_limit_retries() {
-        set_watch_no_retry_mode(true);
-        let runner = MockRunner::from(vec![Ok((
-            1,
-            String::new(),
-            "HTTP 429 Too Many Requests".to_string(),
-        ))]);
-        let args = vec![
-            "gmail".to_string(),
-            "labels".to_string(),
-            "list".to_string(),
-        ];
-        let err = run_gog_with_runner(&runner, &args, &None, true).expect_err("should fail");
-        assert!(matches!(err, AppError::RateLimit(_)));
-        assert_eq!(runner.call_count(), 1);
-        set_watch_no_retry_mode(false);
+        assert!(!should_retry_batch_error(&AppError::Parse(
+            "invalid json".to_string()
+        )));
+        assert!(!should_retry_batch_error(&AppError::Other(
+            "generic".to_string()
+        )));
     }
 
     #[test]
@@ -475,8 +383,6 @@ mod tests {
             &runner,
             &grouped,
             &None,
-            false,
-            false,
             GmailWriteOptions::default(),
         )
         .expect("apply labels failed");
