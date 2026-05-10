@@ -1,7 +1,10 @@
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::models::CacheData;
+
+static LOG_TO_STDERR: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn now_ts() -> i64 {
     SystemTime::now()
@@ -11,14 +14,21 @@ pub(crate) fn now_ts() -> i64 {
 }
 
 pub(crate) fn log(msg: &str) {
+    if LOG_TO_STDERR.load(Ordering::Relaxed) {
+        eprintln!("{msg}");
+        return;
+    }
     println!("{msg}");
 }
 
-pub(crate) fn auto_codex_workers(limit: usize) -> usize {
+pub(crate) fn set_machine_readable_output(enabled: bool) {
+    LOG_TO_STDERR.store(enabled, Ordering::Relaxed);
+}
+
+pub(crate) fn auto_llm_workers() -> usize {
     let cpu = std::thread::available_parallelism().map_or(4, usize::from);
     let mut workers = std::cmp::max(2, cpu / 2);
     workers = std::cmp::min(workers, 8);
-    workers = std::cmp::min(workers, std::cmp::max(1, limit));
     workers
 }
 

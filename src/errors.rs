@@ -9,6 +9,18 @@ pub(crate) enum AppError {
     Other(String),
 }
 
+impl AppError {
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            AppError::RateLimit(_) => "rate_limit",
+            AppError::Config(_) => "config_error",
+            AppError::Command(_) => "command_error",
+            AppError::Parse(_) => "parse_error",
+            AppError::Other(_) => "internal_error",
+        }
+    }
+}
+
 impl Display for AppError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
