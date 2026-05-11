@@ -131,7 +131,10 @@ gmail-auto-label --model deepseek-v4-pro
 gmail-auto-label --sync --imap-user your@gmail.com --imap-pass your-app-password
 ```
 
-> Gmail 应用专用密码在 https://myaccount.google.com/apppasswords 生成（需已开启两步验证）。
+> **IMAP 需使用应用专用密码**：Google 已不再接受普通密码登录 IMAP。
+> 1. 在 https://myaccount.google.com/security 开启**两步验证**
+> 2. 在 https://myaccount.google.com/apppasswords 生成一个**应用专用密码**（选择"Mail"作为应用）
+> 3. 将该 16 位密码（空格可选）作为 `--imap-pass` 参数传入
 
 可选限制同步的邮件数量：
 
@@ -165,7 +168,7 @@ gmail-auto-label --output json
 | `--sync` | 运行 IMAP 同步阶段（拉取+总结） | — |
 | `--from-cache` | 从先前同步的缓存数据中处理 | — |
 | `--imap-user` | IMAP 用户名（邮箱地址） | — |
-| `--imap-pass` | IMAP 密码或应用专用密码 | — |
+| `--imap-pass` | IMAP 应用专用密码（普通密码不可用） | — |
 | `--imap-host` | IMAP 服务器地址 | `imap.gmail.com` |
 | `--imap-port` | IMAP 端口 | `993` |
 | `--sync-max` | 最多同步的邮件数（0 = 不限） | `0` |

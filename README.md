@@ -131,7 +131,10 @@ Phase 1 — Sync all emails via IMAP and summarize via LLM (zero Gmail API reads
 gmail-auto-label --sync --imap-user your@gmail.com --imap-pass your-app-password
 ```
 
-> Gmail app passwords are generated at https://myaccount.google.com/apppasswords (requires 2FA enabled).
+> **IMAP app password required**: Google no longer accepts regular passwords for IMAP access.
+> 1. Enable **2-Step Verification** on your Google account at https://myaccount.google.com/security
+> 2. Generate an **App Password** at https://myaccount.google.com/apppasswords (select "Mail" as the app)
+> 3. Use that 16-character app password (spaces optional) as `--imap-pass`
 
 Optionally limit the number of messages to sync:
 
@@ -165,7 +168,7 @@ gmail-auto-label --output json
 | `--sync` | Run IMAP sync phase (fetch + summarize) | — |
 | `--from-cache` | Process from previously synced cache data | — |
 | `--imap-user` | IMAP username for sync mode | — |
-| `--imap-pass` | IMAP password or app password | — |
+| `--imap-pass` | IMAP app password (regular password won't work) | — |
 | `--imap-host` | IMAP server hostname | `imap.gmail.com` |
 | `--imap-port` | IMAP server port | `993` |
 | `--sync-max` | Max messages to sync (0 = unlimited) | `0` |
