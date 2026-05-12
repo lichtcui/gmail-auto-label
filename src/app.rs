@@ -450,7 +450,7 @@ pub(crate) fn run_with_args(args: Args) -> Result<AppRunSummary> {
             max_messages: args.sync_max,
             cache_file: args.cache_file.clone(),
         };
-        run_sync(&sync_cfg, &mut cache, &llm_config)?;
+        run_sync(&sync_cfg, &mut cache, &llm_config, args.restore_spam)?;
         save_cache(&args.cache_file, &cache)?;
         log(&format!(
             "SYNC: IMAP sync complete — {} threads in cache",
@@ -645,6 +645,7 @@ mod tests {
             sync_max: 0,
             confirm: false,
             force_llm: false,
+            restore_spam: false,
         }
     }
 

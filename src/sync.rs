@@ -34,6 +34,7 @@ pub(crate) fn run_sync(
     config: &SyncConfig,
     cache: &mut CacheData,
     llm_config: &LlmConfig,
+    restore_spam: bool,
 ) -> Result<(), AppError> {
     log(&format!(
         "IMAP_SYNC: connecting to {}:{} ...",
@@ -41,6 +42,14 @@ pub(crate) fn run_sync(
     ));
 
     let mut session = connect_imap(config)?;
+
+    // Phase 0: restore spam emails to Inbox before fetching
+    if restore_spam {
+        restore_spam_emails(&mut session, config)?;
+        // Reconnect — Gmail may invalidate the session after label modifications
+        session = connect_imap(config)?;
+    }
+
     session
         .select("INBOX")
         .map_err(|e| AppError::Other(format!("IMAP SELECT INBOX failed: {e}")))?;
@@ -225,6 +234,89 @@ pub(crate) fn run_sync(
     Ok(())
 }
 
+/// Restore all emails from the Spam folder to Inbox.
+///
+/// Tries common Gmail Spam folder names in order: `[Gmail]/Spam` (English),
+/// `[Gmail]/&ANTNaBpZAEg-` (Chinese). For each message in Spam, copies it to
+/// INBOX and removes the Spam label.
+fn restore_spam_emails(
+    session: &mut imap::Session<native_tls::TlsStream<std::net::TcpStream>>,
+    _config: &SyncConfig,
+) -> Result<(), AppError> {
+    // Try to find the Spam folder — iterate over possible names
+    let spam_folders = [
+        "[Gmail]/Spam",
+        "[Gmail]/&ANTNaBpZAEg-", // Chinese: 垃圾邮件
+    ];
+
+    let spam_folder = spam_folders
+        .iter()
+        .find(|&&name| {
+            session
+                .select(name)
+                .map(|_| {
+                    log(&format!("SPAM_RESTORE: selected folder \"{name}\""));
+                    true
+                })
+                .unwrap_or(false)
+        })
+        .cloned();
+
+    let spam_folder = match spam_folder {
+        Some(f) => f,
+        None => {
+            log("SPAM_RESTORE: no Spam folder found (tried English and Chinese names)");
+            return Ok(());
+        }
+    };
+
+    let uids: Vec<u32> = session
+        .uid_search("ALL")
+        .map_err(|e| AppError::Other(format!("SPAM_RESTORE SEARCH failed: {e}")))?
+        .into_iter()
+        .collect();
+
+    if uids.is_empty() {
+        log("SPAM_RESTORE: no messages in Spam folder");
+        return Ok(());
+    }
+
+    log(&format!(
+        "SPAM_RESTORE: restoring {} messages from Spam to Inbox...",
+        uids.len()
+    ));
+
+    let mut restored = 0usize;
+    for chunk in uids.chunks(100) {
+        let uid_str = chunk
+            .iter()
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // Copy to Inbox
+        if let Err(e) = session.run_command(format!("UID COPY {uid_str} INBOX")) {
+            log(&format!("SPAM_RESTORE COPY failed for batch: {e}"));
+            continue;
+        }
+
+        // Remove Spam label and add Inbox label
+        if let Err(e) = session.run_command(format!(
+            "UID STORE {uid_str} -X-GM-LABELS (\\Spam)"
+        )) {
+            log(&format!("SPAM_RESTORE STORE -Spam failed for batch: {e}"));
+        }
+
+        restored += chunk.len();
+        log(&format!("SPAM_RESTORE: restored {}/{} messages", restored, uids.len()));
+    }
+
+    log(&format!(
+        "SPAM_RESTORE: done — {restored} messages restored from {spam_folder}"
+    ));
+    Ok(())
+}
+
 /// Convert synced threads from cache into `ThreadInfo` vec suitable for the
 /// existing classification pipeline. The LLM summary is placed in `snippet`.
 pub(crate) fn use_synced_data(cache: &CacheData) -> Vec<ThreadInfo> {
@@ -235,7 +327,11 @@ pub(crate) fn use_synced_data(cache: &CacheData) -> Vec<ThreadInfo> {
             id: st.thread_id.clone(),
             sender: st.sender.clone(),
             subject: st.subject.clone(),
-            snippet: st.body_summary.clone(),
+            snippet: if st.body_summary == "No email content provided." {
+                st.subject.clone()
+            } else {
+                st.body_summary.clone()
+            },
         })
         .collect();
     // Stable order: by thread_id

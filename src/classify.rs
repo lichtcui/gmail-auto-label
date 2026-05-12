@@ -133,30 +133,35 @@ pub(crate) fn llm_classify_email(
 1. CI/CD\n\
    - CI/CD流水线、构建、部署、测试失败\n\
    - PR通知、依赖更新\n\
-   - 关键词：build broken, pipeline failed, test flaky, Jenkins, GitHub Actions, pull request, dependency update, merge request\n\n\
+   - 关键词：build broken, pipeline failed, test flaky, Jenkins, GitHub Actions, pull request, merge request, dependency update, PR通知, 依赖更新\n\n\
 2. Security\n\
    - 安全相关通知（提醒、告警、验证、密码变更、2FA、登录提醒）\n\
    - 关键词：security alert, security warning, 2FA, two-factor authentication, login alert, password reset, password change, verification, 安全提醒, 安全告警, 登录通知, 密码重置, 邮箱验证, 账号恢复\n\n\
-3. Newsletter\n\
-   - 其他所有订阅资讯：产品公告、活动通知、游戏资讯、营销推广、调查问卷、公司动态、社交通知、经验分享、配信通知\n\
-   - 关键词：product update, event invitation, game, survey, promotion, marketing, company news, social notification, 产品发布, 活动邀请, 游戏更新, 调查问卷, 营销邮件, 经验分享\n\n\
-4. Recruitment\n\
+3. Recruitment\n\
    - 招聘提醒、招聘邀请、入职相关通知\n\
    - 关键词：job alert, we're hiring, career opportunity, recruitment, job opening, 招聘广告, 入职通知, 入职指引, onboarding, offer, welcome aboard, 新员工, 入职流程\n\n\
-5. Invoice\n\
-   - 发票、账单、订单、订阅续费、付款凭证\n\
-   - 关键词：invoice, bill, receipt, payment, order confirmation, subscription renewal, charge, 账单, 订单通知, 续费通知, 兑换通知\n\n\
+4. Invoice\n\
+   - 仅限：需要用户主动付款的账单、发票、付款请求\n\
+   - 关键词：invoice, bill, payment required, 请付款, 待支付, 发票待开\n\
+   - 不包括：自动续费通知、到期提醒、购买成功确认、试用开始、兑换码（这些归 Newsletter）\n\n\
+5. Newsletter\n\
+   - 所有订阅资讯、产品公告、活动通知、游戏资讯、营销推广、调查问卷、公司动态、社交通知、经验分享、配信通知\n\
+   - 也包括：产品到期提醒、续费提醒、购买成功通知、试用开始通知、注册确认、兑换码发放、自动续费状态通知、服务状态更新\n\
+   - 关键词：product update, event invitation, game, survey, promotion, marketing, company news, social notification, 产品发布, 活动邀请, 游戏更新, 调查问卷, 营销邮件, 经验分享, 到期, 过期, 续期, 续费提醒, 购买成功, 订单成功, 试用, 注册确认, 兑换码, 自动续费, auto-renewal, expiration, renew, trial, welcome, receipt (仅作记录的非付款类收据), purchase confirmation\n\n\
 6. Others\n\
    - 仅用于完全无法归类的邮件（如乱码、测试邮件、个人非业务邮件）\n\n\
 分类规则：\n\
 - 优先级：CI/CD > Security > Invoice > Recruitment > Newsletter > Others\n\
-- 匹配多个关键词时，选优先级最高的类别\n\
+- Invoice 与 Newsletter 的关键区分：\n\
+  - 如果邮件包含\"立即付款\"/\"支付账单\"/\"invoice\"且要求用户主动付款 → Invoice\n\
+  - 如果是到期提醒、续费提醒、购买成功确认、试用开始、兑换码、自动续费状态 → Newsletter\n\
+  - 如果是 Nintendo 收据（purchase receipt）但仅作记录、无付款要求 → Newsletter\n\
 - 只有完全无法匹配时才使用 Others\n\n\
 邮件标题：{subject}\n\
-邮件正文预览（如有）：{snippet}\n\n\
+邮件正文预览（如有）：{body_preview}\n\n\
 输出格式：仅输出类别名称（CI/CD / Security / Newsletter / Recruitment / Invoice / Others）",
         subject = subject,
-        snippet = snippet,
+        body_preview = snippet,
     );
 
     let fallback = |summary: &str, description: &str| LlmClassify {
@@ -184,16 +189,16 @@ pub(crate) fn llm_classify_email(
         }
     };
 
-    let label = trimmed.trim();
-
-    if label.is_empty() {
+    if trimmed.is_empty() {
         return fallback("llm_empty_output", "empty_output");
     }
 
+    // The response is just a category name (plain string), no JSON
+    let label = trimmed.trim().to_string();
     LlmClassify {
         ok: true,
-        label: label.to_string(),
-        summary: label.to_string(),
+        label,
+        summary: "llm_classified".to_string(),
         rule: RuleInput::default(),
     }
 }
@@ -204,12 +209,40 @@ pub(crate) fn llm_classify_refine(
     llm_config: &LlmConfig,
 ) -> LlmClassify {
     let prompt = format!(
-        "这封邮件未被归为 CI/CD、Security、Newsletter、Recruitment 或 Invoice。\n\n\
-请根据内容给出最具体的类别名称（2-5个字），直接输出类别名称，不要额外文字。\n\n\
+        "将以下邮件分类到六个类别之一。不要轻易使用\"Others\"。如果无法确定，优先归入 Newsletter。\n\n\
+类别定义：\n\n\
+1. CI/CD\n\
+   - CI/CD流水线、构建、部署、测试失败\n\
+   - PR通知、依赖更新\n\
+   - 关键词：build broken, pipeline failed, test flaky, Jenkins, GitHub Actions, pull request, merge request, dependency update, PR通知, 依赖更新\n\n\
+2. Security\n\
+   - 安全相关通知（提醒、告警、验证、密码变更、2FA、登录提醒）\n\
+   - 关键词：security alert, security warning, 2FA, two-factor authentication, login alert, password reset, password change, verification, 安全提醒, 安全告警, 登录通知, 密码重置, 邮箱验证, 账号恢复\n\n\
+3. Recruitment\n\
+   - 招聘提醒、招聘邀请、入职相关通知\n\
+   - 关键词：job alert, we're hiring, career opportunity, recruitment, job opening, 招聘广告, 入职通知, 入职指引, onboarding, offer, welcome aboard, 新员工, 入职流程\n\n\
+4. Invoice\n\
+   - 仅限：需要用户主动付款的账单、发票、付款请求\n\
+   - 关键词：invoice, bill, payment required, 请付款, 待支付, 发票待开\n\
+   - 不包括：自动续费通知、到期提醒、购买成功确认、试用开始、兑换码（这些归 Newsletter）\n\n\
+5. Newsletter\n\
+   - 所有订阅资讯、产品公告、活动通知、游戏资讯、营销推广、调查问卷、公司动态、社交通知、经验分享、配信通知\n\
+   - 也包括：产品到期提醒、续费提醒、购买成功通知、试用开始通知、注册确认、兑换码发放、自动续费状态通知、服务状态更新\n\
+   - 关键词：product update, event invitation, game, survey, promotion, marketing, company news, social notification, 产品发布, 活动邀请, 游戏更新, 调查问卷, 营销邮件, 经验分享, 到期, 过期, 续期, 续费提醒, 购买成功, 订单成功, 试用, 注册确认, 兑换码, 自动续费, auto-renewal, expiration, renew, trial, welcome, receipt (仅作记录的非付款类收据), purchase confirmation\n\n\
+6. Others\n\
+   - 仅用于完全无法归类的邮件（如乱码、测试邮件、个人非业务邮件）\n\n\
+分类规则：\n\
+- 优先级：CI/CD > Security > Invoice > Recruitment > Newsletter > Others\n\
+- Invoice 与 Newsletter 的关键区分：\n\
+  - 如果邮件包含\"立即付款\"/\"支付账单\"/\"invoice\"且要求用户主动付款 → Invoice\n\
+  - 如果是到期提醒、续费提醒、购买成功确认、试用开始、兑换码、自动续费状态 → Newsletter\n\
+  - 如果是 Nintendo 收据（purchase receipt）但仅作记录、无付款要求 → Newsletter\n\
+- 只有完全无法匹配时才使用 Others\n\n\
 邮件标题：{subject}\n\
-邮件正文预览：{snippet}",
+邮件正文预览（如有）：{body_preview}\n\n\
+输出格式：仅输出类别名称（CI/CD / Security / Newsletter / Recruitment / Invoice / Others）",
         subject = subject,
-        snippet = snippet,
+        body_preview = snippet,
     );
 
     let fallback = |summary: &str, description: &str| LlmClassify {
@@ -237,16 +270,16 @@ pub(crate) fn llm_classify_refine(
         }
     };
 
-    let label = trimmed.trim();
-
-    if label.is_empty() {
+    if trimmed.is_empty() {
         return fallback("llm_empty_output", "empty_output");
     }
 
+    // The response is just a category name (plain string), no JSON
+    let label = trimmed.trim().to_string();
     LlmClassify {
         ok: true,
-        label: label.to_string(),
-        summary: label.to_string(),
+        label,
+        summary: "llm_classified".to_string(),
         rule: RuleInput::default(),
     }
 }

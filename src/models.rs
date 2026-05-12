@@ -76,6 +76,10 @@ pub(crate) struct Args {
     /// Force LLM classification for all threads (clears memos and consolidation cache)
     #[arg(long)]
     pub(crate) force_llm: bool,
+    /// Restore emails from Spam folder to Inbox before syncing, so they
+    /// get classified and labeled instead of sitting in spam.
+    #[arg(long)]
+    pub(crate) restore_spam: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
