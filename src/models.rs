@@ -10,9 +10,6 @@ pub(crate) const DEFAULT_CACHE_MAX_RULES: usize = 500;
 pub(crate) const DEFAULT_CACHE_MAX_MEMOS: usize = 5000;
 pub(crate) const DEFAULT_MAX_ACTIVE_LABELS: usize = 10;
 pub(crate) const DEFAULT_MERGED_LABEL: &str = "others";
-pub(crate) const DEFAULT_GMAIL_BATCH_SIZE: usize = 100;
-pub(crate) const DEFAULT_GMAIL_BATCH_RETRIES: u32 = 2;
-pub(crate) const DEFAULT_GMAIL_BATCH_RETRY_BACKOFF_SECS: u64 = 1;
 pub(crate) const DEFAULT_FEEDBACK_FILE: &str = "/tmp/gmail_auto_label_feedback.json";
 pub(crate) const DEFAULT_FEEDBACK_BAD_THRESHOLD: u32 = 3;
 pub(crate) const DEFAULT_FEEDBACK_HIT_PENALTY: i64 = 2;
@@ -73,6 +70,12 @@ pub(crate) struct Args {
     /// Max number of messages to sync via IMAP (0 = unlimited)
     #[arg(long, default_value_t = 0)]
     pub(crate) sync_max: usize,
+    /// Review classification results before applying labels
+    #[arg(long)]
+    pub(crate) confirm: bool,
+    /// Force LLM classification for all threads (clears memos and consolidation cache)
+    #[arg(long)]
+    pub(crate) force_llm: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -119,6 +122,13 @@ pub(crate) struct CacheData {
     /// Threads synced via IMAP and summarized by LLM
     #[serde(default)]
     pub(crate) synced_threads: HashMap<String, SyncedThread>,
+    /// Fingerprint of the label set used for the last LLM consolidation.
+    /// If labels haven't changed, reuses the cached mapping instead of calling LLM again.
+    #[serde(default)]
+    pub(crate) consolidation_fingerprint: String,
+    /// Cached label consolidation mapping from the last LLM call.
+    #[serde(default)]
+    pub(crate) consolidation_mapping: HashMap<String, String>,
 }
 
 impl Default for CacheData {
@@ -130,6 +140,8 @@ impl Default for CacheData {
             label_aliases: HashMap::new(),
             feedback_applied_ids: Vec::new(),
             synced_threads: HashMap::new(),
+            consolidation_fingerprint: String::new(),
+            consolidation_mapping: HashMap::new(),
         }
     }
 }
@@ -178,6 +190,9 @@ pub(crate) struct SyncedThread {
     pub(crate) message_count: usize,
     /// Sync timestamp
     pub(crate) ts: i64,
+    /// IMAP UIDs of messages in this thread (for label application via IMAP)
+    #[serde(default)]
+    pub(crate) uids: Vec<u32>,
 }
 
 /// Configuration for IMAP sync mode.
@@ -188,4 +203,5 @@ pub(crate) struct SyncConfig {
     pub(crate) imap_host: String,
     pub(crate) imap_port: u16,
     pub(crate) max_messages: usize,
+    pub(crate) cache_file: String,
 }

@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::cache::{memo_key, rule_id};
 use crate::llm::{LlmConfig, call_chat};
@@ -122,14 +122,41 @@ pub(crate) fn classify_from_cache_with_indexes(
 }
 
 pub(crate) fn llm_classify_email(
-    sender: &str,
+    _sender: &str,
     subject: &str,
     snippet: &str,
     llm_config: &LlmConfig,
 ) -> LlmClassify {
     let prompt = format!(
-        "You are an email classification and rule extraction assistant.\nTask: classify the email into one label and provide a reusable rule.\nOutput must be strict JSON only, with no extra text.\nJSON format:\n{{\n  \"label\": \"label_name\",\n  \"summary\": \"one_sentence_summary\",\n  \"rule\": {{\n    \"description\": \"how this label is determined\",\n    \"include_keywords\": [\"keyword1\", \"keyword2\"],\n    \"exclude_keywords\": [\"exclude1\"]\n  }}\n}}\nRequirements:\n1. Keep label concise (about 2-8 words), suitable for Gmail labels.\n2. include_keywords must contain at least one item and should be useful for future text matching.\n3. If content is limited, still provide the most reasonable label and an actionable rule.\n\nSender: {}\nSubject: {}\nSnippet: {}\n",
-        sender, subject, snippet
+        "将以下邮件分类到六个类别之一。不要轻易使用\"Others\"。如果无法确定，优先归入 Newsletter。\n\n\
+类别定义：\n\n\
+1. CI/CD\n\
+   - CI/CD流水线、构建、部署、测试失败\n\
+   - PR通知、依赖更新\n\
+   - 关键词：build broken, pipeline failed, test flaky, Jenkins, GitHub Actions, pull request, dependency update, merge request\n\n\
+2. Security\n\
+   - 安全相关通知（提醒、告警、验证、密码变更、2FA、登录提醒）\n\
+   - 关键词：security alert, security warning, 2FA, two-factor authentication, login alert, password reset, password change, verification, 安全提醒, 安全告警, 登录通知, 密码重置, 邮箱验证, 账号恢复\n\n\
+3. Newsletter\n\
+   - 其他所有订阅资讯：产品公告、活动通知、游戏资讯、营销推广、调查问卷、公司动态、社交通知、经验分享、配信通知\n\
+   - 关键词：product update, event invitation, game, survey, promotion, marketing, company news, social notification, 产品发布, 活动邀请, 游戏更新, 调查问卷, 营销邮件, 经验分享\n\n\
+4. Recruitment\n\
+   - 招聘提醒、招聘邀请、入职相关通知\n\
+   - 关键词：job alert, we're hiring, career opportunity, recruitment, job opening, 招聘广告, 入职通知, 入职指引, onboarding, offer, welcome aboard, 新员工, 入职流程\n\n\
+5. Invoice\n\
+   - 发票、账单、订单、订阅续费、付款凭证\n\
+   - 关键词：invoice, bill, receipt, payment, order confirmation, subscription renewal, charge, 账单, 订单通知, 续费通知, 兑换通知\n\n\
+6. Others\n\
+   - 仅用于完全无法归类的邮件（如乱码、测试邮件、个人非业务邮件）\n\n\
+分类规则：\n\
+- 优先级：CI/CD > Security > Invoice > Recruitment > Newsletter > Others\n\
+- 匹配多个关键词时，选优先级最高的类别\n\
+- 只有完全无法匹配时才使用 Others\n\n\
+邮件标题：{subject}\n\
+邮件正文预览（如有）：{snippet}\n\n\
+输出格式：仅输出类别名称（CI/CD / Security / Newsletter / Recruitment / Invoice / Others）",
+        subject = subject,
+        snippet = snippet,
     );
 
     let fallback = |summary: &str, description: &str| LlmClassify {
@@ -143,7 +170,7 @@ pub(crate) fn llm_classify_email(
         },
     };
 
-    let trimmed = match call_chat(&prompt, llm_config) {
+    let trimmed = match call_chat(&prompt, llm_config, None) {
         Ok(t) => t,
         Err(e) => {
             let msg = e.to_string();
@@ -157,39 +184,70 @@ pub(crate) fn llm_classify_email(
         }
     };
 
-    if trimmed.is_empty() {
+    let label = trimmed.trim();
+
+    if label.is_empty() {
         return fallback("llm_empty_output", "empty_output");
     }
 
-    let v: Value = match serde_json::from_str(&trimmed) {
-        Ok(v) => v,
-        Err(_) => return fallback("llm_invalid_json", "output_not_valid_json"),
-    };
-    let label = normalize_label(
-        v.get("label")
-            .and_then(Value::as_str)
-            .unwrap_or("uncategorized"),
+    LlmClassify {
+        ok: true,
+        label: label.to_string(),
+        summary: label.to_string(),
+        rule: RuleInput::default(),
+    }
+}
+
+pub(crate) fn llm_classify_refine(
+    subject: &str,
+    snippet: &str,
+    llm_config: &LlmConfig,
+) -> LlmClassify {
+    let prompt = format!(
+        "这封邮件未被归为 CI/CD、Security、Newsletter、Recruitment 或 Invoice。\n\n\
+请根据内容给出最具体的类别名称（2-5个字），直接输出类别名称，不要额外文字。\n\n\
+邮件标题：{subject}\n\
+邮件正文预览：{snippet}",
+        subject = subject,
+        snippet = snippet,
     );
-    let summary = v
-        .get("summary")
-        .and_then(Value::as_str)
-        .unwrap_or("no_summary")
-        .trim()
-        .to_string();
-    let rule = v
-        .get("rule")
-        .and_then(|r| serde_json::from_value::<RuleInput>(r.clone()).ok())
-        .unwrap_or_default();
+
+    let fallback = |summary: &str, description: &str| LlmClassify {
+        ok: false,
+        label: "uncategorized".to_string(),
+        summary: summary.to_string(),
+        rule: RuleInput {
+            description: description.to_string(),
+            include_keywords: vec![String::new()],
+            exclude_keywords: vec![],
+        },
+    };
+
+    let trimmed = match call_chat(&prompt, llm_config, None) {
+        Ok(t) => t,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("timed out") {
+                return fallback("llm_timeout", "timeout_fallback");
+            }
+            if msg.contains("rate limit") || msg.contains("429") {
+                return fallback("llm_rate_limited", "rate_limit_fallback");
+            }
+            return fallback("llm_error", "execution_error");
+        }
+    };
+
+    let label = trimmed.trim();
+
+    if label.is_empty() {
+        return fallback("llm_empty_output", "empty_output");
+    }
 
     LlmClassify {
         ok: true,
-        label,
-        summary: if summary.is_empty() {
-            "no_summary".to_string()
-        } else {
-            summary
-        },
-        rule,
+        label: label.to_string(),
+        summary: label.to_string(),
+        rule: RuleInput::default(),
     }
 }
 
@@ -318,6 +376,127 @@ pub(crate) fn compress_labels_if_needed(
             target
         ));
     }
+}
+
+pub(crate) fn llm_consolidate_labels(
+    cache: &mut CacheData,
+    max_active_labels: usize,
+    llm_config: &LlmConfig,
+) -> bool {
+    let mut scores: HashMap<String, i64> = HashMap::new();
+    for r in &cache.rules {
+        let label = normalize_label(&r.label);
+        if label == "uncategorized" {
+            continue;
+        }
+        *scores.entry(label).or_insert(0) += r.hits;
+    }
+
+    if scores.len() <= max_active_labels {
+        return false;
+    }
+
+    let mut sorted_labels: Vec<&String> = scores.keys().collect();
+    sorted_labels.sort();
+    let mut hasher = Sha256::new();
+    for lbl in &sorted_labels {
+        hasher.update(lbl.as_bytes());
+        hasher.update(b"\0");
+    }
+    let fingerprint = format!("{:x}", hasher.finalize());
+
+    if fingerprint == cache.consolidation_fingerprint && !cache.consolidation_mapping.is_empty() {
+        log("LLM_CONSOLIDATE_CACHE_HIT: reusing previous label consolidation");
+        let mapping = &cache.consolidation_mapping;
+        let mut applied = 0usize;
+        for label in &sorted_labels {
+            if let Some(group) = mapping.get(*label) {
+                let norm_group = normalize_label(group);
+                if **label != norm_group {
+                    cache
+                        .label_aliases
+                        .insert((*label).clone(), norm_group);
+                    applied += 1;
+                }
+            }
+        }
+        if applied > 0 {
+            let unique_groups: HashSet<&String> = mapping.values().collect();
+            log(&format!(
+                "LLM_CONSOLIDATE_CACHE_HIT: {applied} labels merged, reduced from {} to {} groups",
+                sorted_labels.len(),
+                unique_groups.len()
+            ));
+        }
+        return true;
+    }
+
+    let label_lines: Vec<String> = sorted_labels
+        .iter()
+        .map(|l| format!("  \"{l}\" (hits: {})", scores.get(*l).unwrap_or(&0)))
+        .collect();
+
+    let prompt = format!(
+        "You are a label consolidation assistant. Group similar email labels into broad categories.\n\n\
+         Examples:\n\
+         \"CI Failure\", \"CI/CD Failure\" → \"CI/CD\"  (same CI/CD pipeline topic)\n\
+         \"Newsletter A\", \"Promotions\", \"Deals\" → \"Newsletter\"  (all are newsletters/promotions)\n\
+         \"Meeting Notes\", \"Meeting Reminder\", \"Calendar\" → \"Meetings\"  (meeting related)\n\
+         \"Job Alert\", \"Interview Invite\" → \"Job Alerts\"  (job search related)\n\n\
+         Rules:\n\
+         - MERGE AGGRESSIVELY: any labels sharing the same topic area go into one group\n\
+         - The group name should be a short single noun or phrase (1-3 words)\n\
+         - Use the most common existing label as the group name when possible\n\
+         - Every input label MUST be assigned to exactly one group\n\
+         - Output MUST be valid JSON only, with EXACTLY these keys\n\
+         - Total unique groups MUST be at most {max_active_labels}\n\n\
+         Input labels (label: hit_count):\n{labels}\n\n\
+         Output JSON (map each original label to its group name):",
+        labels = label_lines.join("\n")
+    );
+
+    log(&format!(
+        "LLM_CONSOLIDATE: classifying {} labels semantically (max_tokens=8192)...",
+        sorted_labels.len()
+    ));
+    let response = match call_chat(&prompt, llm_config, Some(8192)) {
+        Ok(r) => r,
+        Err(e) => {
+            log(&format!("LLM_CONSOLIDATE_FAILED: {e}"));
+            return false;
+        }
+    };
+
+    let mapping: HashMap<String, String> = match serde_json::from_str(&response) {
+        Ok(m) => m,
+        Err(e) => {
+            log(&format!("LLM_CONSOLIDATE_PARSE_FAILED: {e}"));
+            return false;
+        }
+    };
+
+    let mut applied = 0usize;
+    for (original, group) in &mapping {
+        let norm_orig = normalize_label(original);
+        let norm_group = normalize_label(group);
+        if norm_orig != norm_group && scores.contains_key(&norm_orig) {
+            cache.label_aliases.insert(norm_orig, norm_group);
+            applied += 1;
+        }
+    }
+
+    if applied > 0 {
+        let unique_groups: HashSet<&String> = mapping.values().collect();
+        log(&format!(
+            "LLM_CONSOLIDATED: {applied} labels merged, reduced from {} to {} groups",
+            sorted_labels.len(),
+            unique_groups.len()
+        ));
+    }
+
+    cache.consolidation_fingerprint = fingerprint;
+    cache.consolidation_mapping = mapping;
+    true
 }
 
 pub(crate) fn llm_error_hint(summary: &str) -> Option<&'static str> {

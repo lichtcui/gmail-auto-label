@@ -6,9 +6,12 @@
 //! instead of calling the Gmail API search endpoint.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use rayon::prelude::*;
 
+use crate::cache::save_cache;
 use crate::errors::AppError;
 use crate::llm::{LlmConfig, call_chat};
 use crate::models::{CacheData, SyncConfig, SyncedThread, ThreadInfo};
@@ -69,6 +72,15 @@ pub(crate) fn run_sync(
         threads.len()
     ));
 
+    // Build thread_id -> [UIDs] map for later label application via IMAP
+    let mut thread_uids: HashMap<String, Vec<u32>> = HashMap::new();
+    for (tid, msgs) in &threads {
+        thread_uids.insert(
+            tid.clone(),
+            msgs.iter().map(|m| m._uid).collect(),
+        );
+    }
+
     // Collect uncached thread data for parallel summarization
     struct SyncJob {
         thread_id: String,
@@ -97,6 +109,13 @@ pub(crate) fn run_sync(
     let skipped = threads.len() - jobs.len();
     let total_jobs = jobs.len();
 
+    if skipped > 0 {
+        log(&format!(
+            "IMAP_SYNC: {} threads already cached, skipping them",
+            skipped
+        ));
+    }
+
     if total_jobs == 0 {
         log(&format!(
             "IMAP_SYNC: all {} threads already cached, nothing to summarize",
@@ -118,53 +137,82 @@ pub(crate) fn run_sync(
         .map_err(|e| AppError::Other(format!("Failed to create sync thread pool: {e}")))?;
 
     let now = now_ts();
-    let results: Vec<(String, Result<SyncedThread, String>)> = pool.install(|| {
-        jobs.into_par_iter()
-            .map(|job| {
-                let truncated_body: String = job.body.chars().take(MAX_BODY_CHARS).collect();
-                match summarize_thread_body(&truncated_body, llm_config) {
-                    Ok(summary) => {
-                        let thread_id = job.thread_id.clone();
-                        (
-                            thread_id,
+    let mut summarized = 0usize;
+
+    // Show ~20 progress lines across the entire run
+    let log_every = (total_jobs / 20).max(1);
+
+    // Process jobs in batches of 40 so progress is saved frequently.
+    // If interrupted, only the current batch's work is lost.
+    for batch in jobs.chunks(40) {
+        let done_so_far = summarized;
+        let batch_progress = Arc::new(AtomicUsize::new(0));
+        let batch_log_every = log_every;
+
+        let batch_results: Vec<(String, Result<SyncedThread, String>)> = pool.install(|| {
+            batch
+                .into_par_iter()
+                .map(|job| {
+                    let truncated_body: String =
+                        job.body.chars().take(MAX_BODY_CHARS).collect();
+                    let result = match summarize_thread_body(&truncated_body, llm_config) {
+                        Ok(summary) => (
+                            job.thread_id.clone(),
                             Ok(SyncedThread {
-                                thread_id: job.thread_id,
-                                sender: job.sender,
-                                subject: job.subject,
+                                thread_id: job.thread_id.clone(),
+                                sender: job.sender.clone(),
+                                subject: job.subject.clone(),
                                 body_summary: summary,
                                 message_count: job.message_count,
+                                uids: thread_uids
+                                    .get(&job.thread_id)
+                                    .cloned()
+                                    .unwrap_or_default(),
                                 ts: now,
                             }),
-                        )
+                        ),
+                        Err(e) => (job.thread_id.clone(), Err(e.to_string())),
+                    };
+                    let done = done_so_far + batch_progress.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done % batch_log_every == 0 || done == total_jobs {
+                        log(&format!(
+                            "IMAP_SYNC: summarized {}/{} threads",
+                            done, total_jobs
+                        ));
                     }
-                    Err(e) => (job.thread_id, Err(e.to_string())),
-                }
-            })
-            .collect()
-    });
+                    result
+                })
+                .collect()
+        });
 
-    let mut summarized = 0usize;
-    let mut failed = 0usize;
-    for (thread_id, result) in results {
-        match result {
-            Ok(thread) => {
-                cache.synced_threads.insert(thread_id.clone(), thread);
-                summarized += 1;
-                log(&format!(
-                    "IMAP_SYNC: summarized thread {} ({}/{})",
-                    thread_id.chars().take(12).collect::<String>(),
-                    summarized + failed,
-                    total_jobs
-                ));
+        for (thread_id, result) in batch_results {
+            match result {
+                Ok(thread) => {
+                    cache.synced_threads.insert(thread_id.clone(), thread);
+                    summarized += 1;
+                    log(&format!(
+                        "IMAP_SYNC: summarized thread {} ({}/{})",
+                        thread_id.chars().take(12).collect::<String>(),
+                        summarized,
+                        total_jobs
+                    ));
+                }
+                Err(msg) => {
+                    log(&format!(
+                        "IMAP_SYNC_FAILED: thread {} — {}. Skipping.",
+                        thread_id.chars().take(12).collect::<String>(),
+                        msg
+                    ));
+                }
             }
-            Err(msg) => {
-                failed += 1;
-                log(&format!(
-                    "IMAP_SYNC_FAILED: thread {} — {}. Skipping.",
-                    thread_id.chars().take(12).collect::<String>(),
-                    msg
-                ));
-            }
+        }
+
+        log(&format!(
+            "IMAP_SYNC: saving cache ({}/{})...",
+            summarized, total_jobs
+        ));
+        if let Err(e) = save_cache(&config.cache_file, cache) {
+            log(&format!("IMAP_SYNC_SAVE_WARN: failed to save cache — {}", e));
         }
     }
 
@@ -199,7 +247,7 @@ pub(crate) fn use_synced_data(cache: &CacheData) -> Vec<ThreadInfo> {
 // IMAP connection and fetching
 // ---------------------------------------------------------------------------
 
-fn connect_imap(
+pub(crate) fn connect_imap(
     config: &SyncConfig,
 ) -> Result<imap::Session<native_tls::TlsStream<std::net::TcpStream>>, AppError> {
     let tls = native_tls::TlsConnector::builder()
@@ -240,6 +288,28 @@ struct ParsedMessage {
     body_text: String,
 }
 
+fn parse_fetch(fetch: &imap::types::Fetch) -> Option<ParsedMessage> {
+    let uid = fetch.uid.unwrap_or(0);
+    let body_slice = fetch.body()?;
+    let parsed = mailparse::parse_mail(body_slice).ok()?;
+
+    let thread_id = extract_header(&parsed, "X-GM-THRID")
+        .or_else(|| extract_header(&parsed, "Message-ID").map(|s| tidify(&s)))
+        .unwrap_or_else(|| format!("uid:{uid}"));
+
+    let sender = extract_header(&parsed, "From").unwrap_or_default();
+    let subject = extract_header(&parsed, "Subject").unwrap_or_default();
+    let body_text = extract_body_text(&parsed);
+
+    Some(ParsedMessage {
+        _uid: uid,
+        thread_id,
+        sender,
+        subject,
+        body_text,
+    })
+}
+
 fn fetch_all_messages(
     session: &mut imap::Session<native_tls::TlsStream<std::net::TcpStream>>,
     uids: &[u32],
@@ -253,38 +323,41 @@ fn fetch_all_messages(
             .collect::<Vec<_>>()
             .join(",");
 
-        let fetches = session
-            .uid_fetch(&uid_set, "(BODY[] X-GM-THRID)")
-            .map_err(|e| AppError::Other(format!("IMAP FETCH failed: {e}")))?;
-
-        // uid_fetch returns the fetched data directly (not Option in this version)
-        for fetch in fetches.iter() {
-            let uid = fetch.uid.unwrap_or(0);
-            let body_slice = match fetch.body() {
-                Some(b) => b,
-                None => continue,
-            };
-
-            let parsed = match mailparse::parse_mail(body_slice) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            let thread_id = extract_header(&parsed, "X-GM-THRID")
-                .or_else(|| extract_header(&parsed, "Message-ID").map(|s| tidify(&s)))
-                .unwrap_or_else(|| format!("uid:{uid}"));
-
-            let sender = extract_header(&parsed, "From").unwrap_or_default();
-            let subject = extract_header(&parsed, "Subject").unwrap_or_default();
-            let body_text = extract_body_text(&parsed);
-
-            all_messages.push(ParsedMessage {
-                _uid: uid,
-                thread_id,
-                sender,
-                subject,
-                body_text,
-            });
+        // Try batch fetch first. If it fails (e.g. the `imap` crate can't parse a
+        // Gmail extension response), fall back to individual fetches, skipping bad UIDs.
+        let batch_result = session.uid_fetch(&uid_set, "(BODY[])");
+        match batch_result {
+            Ok(fetches) => {
+                for fetch in fetches.iter() {
+                    if let Some(parsed) = parse_fetch(&fetch) {
+                        all_messages.push(parsed);
+                    }
+                }
+            }
+            Err(e) => {
+                log(&format!(
+                    "IMAP FETCH batch of {} failed: {}, retrying individually...",
+                    chunk.len(),
+                    e
+                ));
+                for &uid in chunk {
+                    match session.uid_fetch(&uid.to_string(), "(BODY[])") {
+                        Ok(fetches) => {
+                            for fetch in fetches.iter() {
+                                if let Some(parsed) = parse_fetch(&fetch) {
+                                    all_messages.push(parsed);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log(&format!(
+                                "IMAP FETCH failed for UID {}, skipping: {}",
+                                uid, e
+                            ));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -449,7 +522,7 @@ Email body:
         body.chars().take(MAX_BODY_CHARS).collect::<String>()
     );
 
-    let raw = call_chat(&prompt, llm_config)?;
+    let raw = call_chat(&prompt, llm_config, None)?;
 
     // Try JSON parse
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
@@ -465,6 +538,144 @@ Email body:
     let fallback: String = body.chars().take(200).collect();
     log("LLM_SUMMARY_FALLBACK: using body head (JSON parse failed or summary field missing)");
     Ok(fallback)
+}
+
+/// Apply Gmail labels to threads via IMAP STORE +X-GM-LABELS.
+/// Uses the stored UIDs from the sync phase to avoid Gmail API rate limits.
+pub(crate) fn apply_labels_via_imap(
+    config: &SyncConfig,
+    grouped: &HashMap<String, Vec<String>>,
+    cache: &CacheData,
+) -> Result<(), AppError> {
+    let mut session = connect_imap(config)?;
+    session
+        .select("INBOX")
+        .map_err(|e| AppError::Other(format!("IMAP SELECT INBOX failed: {e}")))?;
+
+    // Collect all thread_ids that need UID lookup via IMAP search
+    let mut missing_uids: Vec<String> = Vec::new();
+    let mut all_thread_uids: HashMap<&str, Vec<u32>> = HashMap::new();
+    for (_label, thread_ids) in grouped.iter() {
+        for tid in thread_ids {
+            if all_thread_uids.contains_key(tid.as_str()) {
+                continue;
+            }
+            if let Some(st) = cache.synced_threads.get(tid) {
+                if !st.uids.is_empty() {
+                    all_thread_uids.insert(tid.as_str(), st.uids.clone());
+                    continue;
+                }
+            }
+            missing_uids.push(tid.clone());
+        }
+    }
+
+    // Search for UIDs of threads that weren't cached with UIDs
+    if !missing_uids.is_empty() {
+        log(&format!(
+            "IMAP_UID_SEARCH: looking up UIDs for {} threads via X-GM-THRID",
+            missing_uids.len()
+        ));
+        let mut search_ok = true;
+        for tid in &missing_uids {
+            if !search_ok {
+                log(&format!("IMAP_UID_SEARCH_SKIP: thread={tid} (previous search corrupted session)"));
+                continue;
+            }
+            match session.uid_search(format!("X-GM-THRID {tid}")) {
+                Ok(ids) => {
+                    let uids: Vec<u32> = ids.into_iter().collect();
+                    if !uids.is_empty() {
+                        all_thread_uids.insert(tid.as_str(), uids);
+                    }
+                }
+                Err(e) => {
+                    log(&format!(
+                        "IMAP_UID_SEARCH_FAILED: thread={tid} error={e}"
+                    ));
+                    search_ok = false;
+                    // Reconnect after a search failure
+                    match connect_imap(config) {
+                        Ok(mut new_session) => {
+                            new_session.select("INBOX").ok();
+                            session = new_session;
+                            log("IMAP_RECONNECTED: reconnected after search failure");
+                        }
+                        Err(re) => log(&format!("IMAP_RECONNECT_FAILED: {re}")),
+                    }
+                }
+            }
+        }
+    }
+
+    let mut total_applied = 0usize;
+    for (label, thread_ids) in grouped {
+        let mut uids: Vec<u32> = Vec::new();
+        for tid in thread_ids {
+            if let Some(found) = all_thread_uids.get(tid.as_str()) {
+                uids.extend(found);
+            }
+        }
+        uids.sort();
+        uids.dedup();
+
+        if uids.is_empty() {
+            log(&format!("IMAP_LABEL_SKIP: label={label} no UIDs found"));
+            continue;
+        }
+
+        let mut label_applied = 0usize;
+        for chunk in uids.chunks(100) {
+            let uid_str = chunk
+                .iter()
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+
+            // Quote label name if it contains IMAP-special chars
+            let imap_label = if label.contains(' ') || label.contains('"') || label.contains('\\')
+            {
+                format!("\"{}\"", label.replace('\\', "\\\\").replace('"', "\\\""))
+            } else {
+                label.clone()
+            };
+
+            // Use run_command (fire-and-forget) to avoid the imap-proto parser
+            // choking on Gmail's X-GM-LABELS FETCH responses.
+            if session
+                .run_command(format!("UID STORE {uid_str} +X-GM-LABELS ({imap_label})"))
+                .is_err()
+            {
+                log(&format!(
+                    "IMAP_LABEL_SKIP: label={label} uids={}... send failed",
+                    chunk.len()
+                ));
+                continue;
+            }
+            // Archive: remove from INBOX (best-effort)
+            let _ = session
+                .run_command(format!("UID STORE {uid_str} -X-GM-LABELS (\\Inbox)"));
+
+            label_applied += chunk.len();
+        }
+
+        // Drain unreadable X-GM-LABELS responses by reconnecting.
+        match connect_imap(config) {
+            Ok(mut new_session) => {
+                new_session.select("INBOX").ok();
+                session = new_session;
+            }
+            Err(e) => {
+                log(&format!("IMAP_RECONNECT_FAILED: label={label} error={e}"));
+            }
+        }
+
+        total_applied += label_applied;
+        log(&format!("IMAP_LABEL_APPLIED: {label} -> {label_applied} messages"));
+    }
+
+    log(&format!("IMAP_LABEL_DONE: applied labels to {total_applied} messages"));
+    Ok(())
 }
 
 #[cfg(test)]

@@ -59,14 +59,14 @@ fn shared_client() -> &'static reqwest::blocking::Client {
 /// Call DeepSeek chat completions in non-streaming mode.
 /// Retries transient failures (rate limits, 5xx, network errors) with exponential backoff.
 /// Returns the raw text content of the assistant's reply.
-pub(crate) fn call_chat(prompt: &str, config: &LlmConfig) -> Result<String, AppError> {
+pub(crate) fn call_chat(prompt: &str, config: &LlmConfig, max_tokens: Option<u32>) -> Result<String, AppError> {
     let body = serde_json::json!({
         "model": config.model,
         "messages": [
             {"role": "user", "content": prompt}
         ],
         "temperature": 0.01,
-        "max_tokens": 1024,
+        "max_tokens": max_tokens.unwrap_or(1024),
         "stream": false,
     });
 

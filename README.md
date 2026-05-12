@@ -13,69 +13,27 @@ This is the primary documentation.
 ## Features
 
 - Auto-scan inbox threads and classify emails into business-friendly labels
-- **Two-phase workflow**: IMAP sync + LLM summarization → batch classification + label application (avoids Gmail API rate limits)
+- **Two-phase workflow**: IMAP sync + LLM summarization → batch classification + label application (no Gmail API calls needed)
 - Cache-first classification (memo + reusable rules) to reduce repeated LLM calls
 - LLM fallback for uncached emails, then persist extracted rules for later reuse
-- Auto-create missing Gmail labels and apply labels in batches
-- Automatic archive step (remove `INBOX`) after labeling
-- Label compression when active labels exceed the limit (`--max-labels`, merge target defaults to `others`)
-- Gmail rate-limit handling with automatic retry/backoff
+- LLM-based label consolidation: when labels exceed the limit, semantically groups similar labels instead of blindly merging low-frequency ones
+- Labels auto-created by Gmail IMAP (no separate API calls required)
+- Automatic archive step (remove `INBOX`) after labeling via IMAP
 - Machine-readable JSON output (`--output json`)
 
 ## Prerequisites
 
-- `gog` is installed and authenticated (for Gmail write operations)
 - DeepSeek API key (set via `--api-key` or `DEEPSEEK_API_KEY` env var)
 - Rust toolchain is installed
+- Gmail IMAP app password (see [IMAP Setup](#imap-setup) below)
 
-## gog Setup
+## IMAP Setup
 
-1. Install `gog` for your operating system.
-2. Sign in:
+Gmail requires an app password for IMAP access. Regular passwords will not work.
 
-```bash
-gog auth login
-```
-
-3. Verify Gmail access:
-
-```bash
-gog gmail labels list --no-input --json
-```
-
-4. List local accounts (to confirm account names):
-
-```bash
-gog auth list
-```
-
-5. For multiple accounts, pass account name when running this tool:
-
-```bash
-gmail-auto-label --account your-account-name
-```
-
-Note: all Gmail operations are executed through `gog`. If auth or permissions are missing, the tool will fail at runtime.
-
-### gog Troubleshooting
-
-1. Check current auth/session status:
-
-```bash
-gog auth status
-```
-
-2. Quick Gmail API read test:
-
-```bash
-gog gmail search "in:inbox" --max 1 --no-input --json
-```
-
-3. Re-login if token/permission is invalid:
-
-```bash
-gog auth login
-```
+1. Enable **2-Step Verification** on your Google account at https://myaccount.google.com/security
+2. Generate an **App Password** at https://myaccount.google.com/apppasswords (select "Mail" as the app)
+3. Use that 16-character app password as `--imap-pass` (spaces optional)
 
 ## Build
 
@@ -142,13 +100,13 @@ Optionally limit the number of messages to sync:
 gmail-auto-label --sync --imap-user your@gmail.com --imap-pass xxxx --sync-max 5000
 ```
 
-Phase 2 — Classify from cached summaries and batch-apply labels:
+Phase 2 — Classify from cached summaries and batch-apply labels via IMAP:
 
 ```bash
-gmail-auto-label --from-cache
+gmail-auto-label --from-cache --imap-user your@gmail.com --imap-pass your-app-password
 ```
 
-This phase only calls the Gmail API for label creation and modification (write operations), bypassing read quota entirely.
+This phase uses IMAP `STORE +X-GM-LABELS` to apply labels — zero Gmail API calls. Labels are auto-created by Gmail IMAP when they don't exist.
 
 Machine-readable JSON output:
 
@@ -160,14 +118,13 @@ gmail-auto-label --output json
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--account` | gog account name | — |
 | `--api-key` | DeepSeek API key (or `DEEPSEEK_API_KEY` env) | — |
 | `--model` | DeepSeek model name | `deepseek-v4-flash` |
 | `--max-labels` | Max active labels before compression | `10` |
 | `--output` | Output format (`text` \| `json`) | `text` |
 | `--sync` | Run IMAP sync phase (fetch + summarize) | — |
-| `--from-cache` | Process from previously synced cache data | — |
-| `--imap-user` | IMAP username for sync mode | — |
+| `--from-cache` | Process from previously synced cache data (requires `--imap-user` + `--imap-pass`) | — |
+| `--imap-user` | IMAP username (Gmail address) | — |
 | `--imap-pass` | IMAP app password (regular password won't work) | — |
 | `--imap-host` | IMAP server hostname | `imap.gmail.com` |
 | `--imap-port` | IMAP server port | `993` |
@@ -179,7 +136,6 @@ These flags remain supported for compatibility, but are hidden by default:
 
 - `--cache-file`
 - `--merged-label`
-- Legacy compatibility: `--loop` + `--interval` still work, but `--watch` is the preferred form
 
 Built-in feedback file format (internal path is fixed to `/tmp/gmail_auto_label_feedback.json`):
 
@@ -207,10 +163,10 @@ Phase 1: IMAP Sync (--sync)
   IMAP inbox ──► parse MIME ──► extract body text ──► LLM summarize ──► cache (local JSON)
 
 Phase 2: Process from Cache (--from-cache)
-  cache ──► classify (cached memos → learned rules → LLM) ──► batch apply labels
+  cache ──► classify (cached memos → learned rules → LLM) ──► IMAP STORE +X-GM-LABELS
 ```
 
-Phase 2 reads exclusively from the local cache — zero Gmail API read calls. Only the final label write step (via `gog gmail labels modify`) touches the Gmail API, which means the full read quota is available for write operations.
+Phase 2 reads exclusively from the local cache — zero Gmail API calls. Labels are applied via IMAP's `STORE +X-GM-LABELS` command, which also auto-creates labels if they don't exist.
 
 ### Classification Priority
 
@@ -221,7 +177,7 @@ Phase 2 reads exclusively from the local cache — zero Gmail API read calls. On
 ### Rate Limiting
 
 - Read operations (IMAP sync, Phase 1): No Gmail API calls
-- Write operations (label create/modify, Phase 2): Uses Gmail API with adaptive batch sizing and retry/backoff
+- Write operations (label create/modify, Phase 2): All operations via IMAP — no Gmail API calls, no rate limits
 - LLM calls: Automatic retry with exponential backoff (1s, 2s, 4s) for transient failures
 
 ## Help

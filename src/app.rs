@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -11,17 +12,16 @@ use crate::cache::{
 };
 use crate::classify::{
     build_rule_priority_indexes, classify_from_cache_with_indexes, classify_with_llm_result,
-    compress_labels_if_needed, llm_classify_email, llm_error_hint,
+    compress_labels_if_needed, llm_classify_email, llm_classify_refine, llm_consolidate_labels, llm_error_hint,
 };
 use crate::errors::AppError;
-use crate::gog::{GmailWriteOptions, apply_labels_with_options, ensure_label};
 use crate::llm::LlmConfig;
 use crate::models::{
     Args, CacheData, DEFAULT_CACHE_MAX_MEMOS, DEFAULT_CACHE_MAX_RULES, DEFAULT_CACHE_TTL_HOURS,
     DEFAULT_FEEDBACK_BAD_THRESHOLD, DEFAULT_FEEDBACK_FILE, DEFAULT_FEEDBACK_HIT_PENALTY,
     DEFAULT_FEEDBACK_MAX_AGE_HOURS, LlmClassify, OutputFormat, SyncConfig, ThreadInfo,
 };
-use crate::sync::{run_sync, use_synced_data};
+use crate::sync::{apply_labels_via_imap, run_sync, use_synced_data};
 use crate::utils::{
     auto_llm_workers, log, resolve_label_alias, set_machine_readable_output,
 };
@@ -49,12 +49,6 @@ pub(crate) struct AppRunSummary {
 }
 
 trait AppDeps: Sync {
-    fn ensure_label(
-        &self,
-        label: &str,
-        existing_labels: &mut HashSet<String>,
-        account: &Option<String>,
-    ) -> std::result::Result<(), DynErr>;
     fn llm_classify_email(
         &self,
         sender: &str,
@@ -62,26 +56,11 @@ trait AppDeps: Sync {
         snippet: &str,
         llm_config: &LlmConfig,
     ) -> LlmClassify;
-    fn apply_labels(
-        &self,
-        grouped: &HashMap<String, Vec<String>>,
-        account: &Option<String>,
-        write_options: GmailWriteOptions,
-    ) -> std::result::Result<(), DynErr>;
 }
 
 struct RealDeps;
 
 impl AppDeps for RealDeps {
-    fn ensure_label(
-        &self,
-        label: &str,
-        existing_labels: &mut HashSet<String>,
-        account: &Option<String>,
-    ) -> std::result::Result<(), DynErr> {
-        ensure_label(label, existing_labels, account)
-    }
-
     fn llm_classify_email(
         &self,
         sender: &str,
@@ -91,20 +70,12 @@ impl AppDeps for RealDeps {
     ) -> LlmClassify {
         llm_classify_email(sender, subject, snippet, llm_config)
     }
-
-    fn apply_labels(
-        &self,
-        grouped: &HashMap<String, Vec<String>>,
-        account: &Option<String>,
-        write_options: GmailWriteOptions,
-    ) -> std::result::Result<(), DynErr> {
-        apply_labels_with_options(grouped, account, write_options)
-    }
 }
 
 fn collect_threads(
     cache: &mut CacheData,
     threads: &[ThreadInfo],
+    force_llm: bool,
 ) -> std::result::Result<
     (
         HashMap<String, Vec<String>>,
@@ -124,24 +95,26 @@ fn collect_threads(
     let mut llm_jobs: Vec<ThreadInfo> = Vec::new();
 
     for t in threads {
-        if let Some((label, source)) = classify_from_cache_with_indexes(
-            &t.sender,
-            &t.subject,
-            &t.snippet,
-            cache,
-            DEFAULT_CACHE_TTL_HOURS,
-            &rule_indexes,
-        ) {
-            metrics.cache_hits += 1;
-            grouped.entry(label.clone()).or_default().push(t.id.clone());
-            processed_ids.push(t.id.clone());
-            log(&format!(
-                "CLASSIFY: thread={} label={} source={} summary=cache_hit",
-                t.id, label, source
-            ));
-        } else {
-            llm_jobs.push(t.clone());
+        if !force_llm {
+            if let Some((label, source)) = classify_from_cache_with_indexes(
+                &t.sender,
+                &t.subject,
+                &t.snippet,
+                cache,
+                DEFAULT_CACHE_TTL_HOURS,
+                &rule_indexes,
+            ) {
+                metrics.cache_hits += 1;
+                grouped.entry(label.clone()).or_default().push(t.id.clone());
+                processed_ids.push(t.id.clone());
+                log(&format!(
+                    "CLASSIFY: thread={} label={} source={} summary=cache_hit",
+                    t.id, label, source
+                ));
+                continue;
+            }
         }
+        llm_jobs.push(t.clone());
     }
 
     metrics.llm_jobs = llm_jobs.len();
@@ -152,15 +125,16 @@ fn collect_threads(
 fn run_llm_classify<D: AppDeps>(
     deps: &D,
     cache: &mut CacheData,
+    cache_file: &str,
     llm_config: &LlmConfig,
     effective_workers: usize,
     llm_pool: &mut Option<ThreadPool>,
     llm_jobs: Vec<ThreadInfo>,
     grouped: &mut HashMap<String, Vec<String>>,
     processed_ids: &mut Vec<String>,
-) -> std::result::Result<(usize, usize), DynErr> {
+) -> std::result::Result<(usize, usize, Vec<ThreadInfo>), DynErr> {
     if llm_jobs.is_empty() {
-        return Ok((0, 0));
+        return Ok((0, 0, Vec::new()));
     }
 
     log(&format!(
@@ -169,12 +143,24 @@ fn run_llm_classify<D: AppDeps>(
         effective_workers
     ));
 
+    let started = Instant::now();
+    let total = llm_jobs.len();
+
     let results = if effective_workers <= 1 {
         llm_jobs
             .into_iter()
-            .map(|job| {
+            .enumerate()
+            .map(|(i, job)| {
                 let res =
                     deps.llm_classify_email(&job.sender, &job.subject, &job.snippet, llm_config);
+                let done = i + 1;
+                if done % 50 == 0 || done == total {
+                    log(&format!(
+                        "LLM_PROGRESS: {done}/{total} ({:.0}%) elapsed={}s",
+                        done as f64 / total as f64 * 100.0,
+                        started.elapsed().as_secs()
+                    ));
+                }
                 (job, res)
             })
             .collect::<Vec<_>>()
@@ -192,6 +178,7 @@ fn run_llm_classify<D: AppDeps>(
         let pool = llm_pool
             .as_ref()
             .ok_or_else(|| AppError::Other("LLM thread pool is not initialized".to_string()))?;
+        let counter = AtomicUsize::new(0);
         pool.install(|| {
             llm_jobs
                 .into_par_iter()
@@ -202,6 +189,14 @@ fn run_llm_classify<D: AppDeps>(
                         &job.snippet,
                         llm_config,
                     );
+                    let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done % 50 == 0 || done == total {
+                        log(&format!(
+                            "LLM_PROGRESS: {done}/{total} ({:.0}%) elapsed={}s",
+                            done as f64 / total as f64 * 100.0,
+                            started.elapsed().as_secs()
+                        ));
+                    }
                     (job, res)
                 })
                 .collect::<Vec<_>>()
@@ -212,8 +207,9 @@ fn run_llm_classify<D: AppDeps>(
     let mut llm_setup_failures = 0usize;
     let mut llm_success = 0usize;
     let mut llm_failures = 0usize;
+    let mut others_entries: Vec<ThreadInfo> = Vec::new();
 
-    for (job, result) in results {
+    for (n, (job, result)) in results.into_iter().enumerate() {
         let (label, source, summary) =
             classify_with_llm_result(&job.sender, &job.subject, &job.snippet, cache, &result);
         if source == "llm:error" && label == "uncategorized" {
@@ -234,11 +230,21 @@ fn run_llm_classify<D: AppDeps>(
             .entry(label.clone())
             .or_default()
             .push(job.id.clone());
+        if label == "Others" {
+            others_entries.push(job.clone());
+        }
         processed_ids.push(job.id.clone());
         log(&format!(
             "CLASSIFY: thread={} label={} source={} summary={}",
             job.id, label, source, summary
         ));
+
+        let done = n + 1;
+        if done % 50 == 0 || done == total_results {
+            if let Err(e) = save_cache(cache_file, cache) {
+                log(&format!("CACHE_SAVE_WARN: periodic save failed: {e}"));
+            }
+        }
     }
 
     if total_results > 0 && llm_setup_failures == total_results {
@@ -248,7 +254,7 @@ fn run_llm_classify<D: AppDeps>(
         ));
     }
 
-    Ok((llm_success, llm_failures))
+    Ok((llm_success, llm_failures, others_entries))
 }
 
 fn regroup_by_alias(
@@ -266,60 +272,15 @@ fn regroup_by_alias(
     regrouped
 }
 
-fn ensure_grouped_labels_exist<D: AppDeps>(
-    deps: &D,
-    grouped: &HashMap<String, Vec<String>>,
-    account: &Option<String>,
-    existing_labels: &mut HashSet<String>,
-) -> std::result::Result<(), DynErr> {
-    let mut labels = grouped
-        .iter()
-        .filter(|(_, ids)| !ids.is_empty())
-        .map(|(label, _)| label.as_str())
-        .collect::<Vec<_>>();
-    labels.sort_unstable();
-
-    for label in labels {
-        deps.ensure_label(label, existing_labels, account)?;
-    }
-
-    Ok(())
-}
-
-fn seed_existing_labels(
-    cache: &CacheData,
-    merged_label: &str,
-) -> HashSet<String> {
-    let mut labels = HashSet::new();
-    for rule in &cache.rules {
-        let label = rule.label.trim();
-        if !label.is_empty() {
-            labels.insert(label.to_string());
-        }
-    }
-    for alias_target in cache.label_aliases.values() {
-        let label = alias_target.trim();
-        if !label.is_empty() {
-            labels.insert(label.to_string());
-        }
-    }
-    let merged = merged_label.trim();
-    if !merged.is_empty() {
-        labels.insert(merged.to_string());
-    }
-    labels
-}
-
 #[allow(clippy::too_many_arguments)]
 fn process_once_with_deps<D: AppDeps>(
     deps: &D,
     args: &Args,
     cache: &mut CacheData,
-    existing_labels: &mut HashSet<String>,
     effective_workers: usize,
     llm_pool: &mut Option<ThreadPool>,
-    write_options: GmailWriteOptions,
     llm_config: &LlmConfig,
+    imap_config: Option<&SyncConfig>,
 ) -> std::result::Result<(String, RoundMetrics), DynErr> {
     let pending_threads = use_synced_data(cache);
     log(&format!(
@@ -332,10 +293,11 @@ fn process_once_with_deps<D: AppDeps>(
     }
 
     let (mut grouped, mut processed_ids, llm_jobs, mut metrics) =
-        collect_threads(cache, &pending_threads)?;
-    let (llm_success, llm_failures) = run_llm_classify(
+        collect_threads(cache, &pending_threads, args.force_llm)?;
+    let (llm_success, llm_failures, others_entries) = run_llm_classify(
         deps,
         cache,
+        &args.cache_file,
         llm_config,
         effective_workers,
         llm_pool,
@@ -346,27 +308,83 @@ fn process_once_with_deps<D: AppDeps>(
     metrics.llm_success = llm_success;
     metrics.llm_failures = llm_failures;
 
-    compress_labels_if_needed(cache, args.max_labels, &args.merged_label);
-    let grouped = regroup_by_alias(grouped, cache);
-    ensure_grouped_labels_exist(deps, &grouped, &args.account, existing_labels)?;
-    deps.apply_labels(
-        &grouped,
-        &args.account,
-        write_options,
-    )?;
+    if !llm_consolidate_labels(cache, args.max_labels, llm_config) {
+        compress_labels_if_needed(cache, args.max_labels, &args.merged_label);
+    }
+    let mut grouped = regroup_by_alias(grouped, cache);
+
+    if !others_entries.is_empty() {
+        eprintln!("\n>>> Re-classifying {} Others entries with refined prompt...", others_entries.len());
+        let others_ids: std::collections::HashSet<&str> =
+            others_entries.iter().map(|j| j.id.as_str()).collect();
+        if let Some(others_group) = grouped.get_mut("Others") {
+            others_group.retain(|id| !others_ids.contains(id.as_str()));
+            if others_group.is_empty() {
+                grouped.remove("Others");
+            }
+        }
+
+        struct RefineDeps;
+        impl AppDeps for RefineDeps {
+            fn llm_classify_email(
+                &self,
+                _sender: &str,
+                subject: &str,
+                snippet: &str,
+                llm_config: &LlmConfig,
+            ) -> LlmClassify {
+                llm_classify_refine(subject, snippet, llm_config)
+            }
+        }
+
+        run_llm_classify(
+            &RefineDeps,
+            cache,
+            &args.cache_file,
+            llm_config,
+            effective_workers,
+            llm_pool,
+            others_entries,
+            &mut grouped,
+            &mut processed_ids,
+        )?;
+    }
 
     let total: usize = grouped.values().map(Vec::len).sum();
     metrics.labeled_threads = total;
     let mut keys: Vec<String> = grouped.keys().cloned().collect();
     keys.sort();
     let summary = keys
-        .into_iter()
-        .filter_map(|k| grouped.get(&k).map(|ids| (k, ids.len())))
+        .iter()
+        .filter_map(|k| grouped.get(k).map(|ids| (k, ids.len())))
         .filter(|(_, n)| *n > 0)
         .map(|(k, n)| format!("{}:{}", k, n))
         .collect::<Vec<_>>()
         .join(" | ");
-    log(&format!("ROUND_DONE: total={} | {}", total, summary));
+    log(&format!("CLASSIFY_DONE: total={} | {}", total, summary));
+
+    if let Some(imap_cfg) = imap_config {
+        if args.confirm {
+            eprintln!("\n=== Classification Summary ===");
+            for k in &keys {
+                if let Some(ids) = grouped.get(k) {
+                    if !ids.is_empty() {
+                        eprintln!("  {k}: {} threads", ids.len());
+                    }
+                }
+            }
+            eprintln!("  Total: {total} threads\n");
+            eprint!("Apply these labels? [y/N] ");
+            use std::io::BufRead;
+            let stdin = std::io::stdin();
+            let input = stdin.lock().lines().next().and_then(|r| r.ok()).unwrap_or_default();
+            if !input.trim().eq_ignore_ascii_case("y") {
+                log("CONFIRM_SKIP: user declined, labels not applied");
+                return Ok(("classified".to_string(), metrics));
+            }
+        }
+        apply_labels_via_imap(imap_cfg, &grouped, cache)?;
+    }
 
     Ok(("processed".to_string(), metrics))
 }
@@ -398,11 +416,19 @@ pub(crate) fn run_with_args(args: Args) -> Result<AppRunSummary> {
         DEFAULT_CACHE_MAX_MEMOS,
         DEFAULT_CACHE_TTL_HOURS,
     );
-    let last_saved_fingerprint = cache_fingerprint(&cache)?;
 
-    // Avoid startup `labels list` call to reduce Gmail API usage.
-    // Seed from local known labels, then create on demand when needed.
-    let mut existing_labels = seed_existing_labels(&cache, &args.merged_label);
+    if args.force_llm {
+        let memo_count = cache.memos.len();
+        cache.memos.clear();
+        cache.consolidation_fingerprint.clear();
+        cache.consolidation_mapping.clear();
+        log(&format!(
+            "FORCE_LLM: cleared {} memos and consolidation cache, all threads go to LLM",
+            memo_count
+        ));
+    }
+
+    let last_saved_fingerprint = cache_fingerprint(&cache)?;
 
     let llm_config = LlmConfig::from_opt(args.api_key.clone(), Some(args.model.clone()))?;
 
@@ -422,6 +448,7 @@ pub(crate) fn run_with_args(args: Args) -> Result<AppRunSummary> {
             imap_host: args.imap_host.clone(),
             imap_port: args.imap_port,
             max_messages: args.sync_max,
+            cache_file: args.cache_file.clone(),
         };
         run_sync(&sync_cfg, &mut cache, &llm_config)?;
         save_cache(&args.cache_file, &cache)?;
@@ -468,16 +495,37 @@ pub(crate) fn run_with_args(args: Args) -> Result<AppRunSummary> {
         ));
     }
 
+    // IMAP credentials required for label application (gog/Gmail API removed)
+    let imap_config = if args.from_cache {
+        let imap_user = args
+            .imap_user
+            .clone()
+            .ok_or_else(|| AppError::Config("--imap-user is required with --from-cache (gog removed)".to_string()))?;
+        let imap_pass = args
+            .imap_pass
+            .clone()
+            .ok_or_else(|| AppError::Config("--imap-pass is required with --from-cache (gog removed)".to_string()))?;
+        Some(SyncConfig {
+            imap_user,
+            imap_pass,
+            imap_host: args.imap_host.clone(),
+            imap_port: args.imap_port,
+            max_messages: 0,
+            cache_file: String::new(),
+        })
+    } else {
+        None
+    };
+
     let round_started = Instant::now();
     let (state, metrics) = match process_once_with_deps(
         &RealDeps,
         &args,
         &mut cache,
-        &mut existing_labels,
         effective_workers,
         &mut llm_pool,
-        GmailWriteOptions::default(),
         &llm_config,
+        imap_config.as_ref(),
     ) {
         Ok(v) => v,
         Err(e) => match e {
@@ -519,7 +567,7 @@ pub(crate) fn run_with_args(args: Args) -> Result<AppRunSummary> {
     }
 
     let current_fingerprint = cache_fingerprint(&cache)?;
-    if current_fingerprint != last_saved_fingerprint {
+    if state == "processed" && current_fingerprint != last_saved_fingerprint {
         save_cache(&args.cache_file, &cache)?;
     }
 
@@ -538,7 +586,6 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::cache::memo_key;
     use crate::classify::{llm_error_hint, rule_matches};
     use crate::models::{
         DEFAULT_CACHE_FILE, DEFAULT_MAX_ACTIVE_LABELS, DEFAULT_MERGED_LABEL, OutputFormat, Rule,
@@ -555,6 +602,7 @@ mod tests {
                 subject: subject.to_string(),
                 body_summary: snippet.to_string(),
                 message_count: 1,
+                uids: vec![],
                 ts: now_ts(),
             },
         );
@@ -562,22 +610,10 @@ mod tests {
 
     struct MockDeps {
         llm_result: LlmClassify,
-        applied: Mutex<Vec<HashMap<String, Vec<String>>>>,
-        remove_inbox_flags: Mutex<Vec<bool>>,
         llm_calls: Mutex<usize>,
     }
 
     impl AppDeps for MockDeps {
-        fn ensure_label(
-            &self,
-            label: &str,
-            existing_labels: &mut HashSet<String>,
-            _account: &Option<String>,
-        ) -> std::result::Result<(), DynErr> {
-            existing_labels.insert(label.to_string());
-            Ok(())
-        }
-
         fn llm_classify_email(
             &self,
             _sender: &str,
@@ -588,23 +624,6 @@ mod tests {
             let mut calls = self.llm_calls.lock().expect("lock poisoned");
             *calls += 1;
             self.llm_result.clone()
-        }
-
-        fn apply_labels(
-            &self,
-            grouped: &HashMap<String, Vec<String>>,
-            _account: &Option<String>,
-            _write_options: GmailWriteOptions,
-        ) -> std::result::Result<(), DynErr> {
-            self.applied
-                .lock()
-                .expect("lock poisoned")
-                .push(grouped.clone());
-            self.remove_inbox_flags
-                .lock()
-                .expect("lock poisoned")
-                .push(true);
-            Ok(())
         }
     }
 
@@ -624,11 +643,9 @@ mod tests {
             imap_port: 993,
             from_cache: false,
             sync_max: 0,
+            confirm: false,
+            force_llm: false,
         }
-    }
-
-    fn default_write_options() -> GmailWriteOptions {
-        GmailWriteOptions::default()
     }
 
     fn test_llm_config() -> LlmConfig {
@@ -682,8 +699,6 @@ mod tests {
                     exclude_keywords: vec![],
                 },
             },
-            applied: Mutex::new(Vec::new()),
-            remove_inbox_flags: Mutex::new(Vec::new()),
             llm_calls: Mutex::new(0),
         };
         let args = make_args();
@@ -695,34 +710,23 @@ mod tests {
             "monthly invoice",
             "invoice attached",
         );
-        let mut existing_labels = HashSet::new();
+
         let mut llm_pool: Option<ThreadPool> = None;
 
         let (state, metrics) = process_once_with_deps(
             &deps,
             &args,
             &mut cache,
-            &mut existing_labels,
             1,
             &mut llm_pool,
-            default_write_options(),
             &test_llm_config(),
+            None,
         )
         .expect("process_once should succeed");
         assert_eq!(state, "processed");
         assert_eq!(metrics.total_threads, 1);
         assert_eq!(metrics.llm_jobs, 1);
         assert_eq!(metrics.llm_success, 1);
-
-        let applied = deps.applied.lock().expect("lock poisoned");
-        assert_eq!(applied.len(), 1);
-        let grouped = &applied[0];
-        let ids = grouped.get("账单").expect("expected 账单 label");
-        assert_eq!(ids, &vec!["t1".to_string()]);
-
-        let remove_inbox_flags = deps.remove_inbox_flags.lock().expect("lock poisoned");
-        assert_eq!(remove_inbox_flags.len(), 1);
-        assert!(remove_inbox_flags[0]);
         assert_eq!(*deps.llm_calls.lock().expect("lock poisoned"), 1);
     }
 
@@ -750,23 +754,20 @@ mod tests {
                 summary: "unused".to_string(),
                 rule: RuleInput::default(),
             },
-            applied: Mutex::new(Vec::new()),
-            remove_inbox_flags: Mutex::new(Vec::new()),
             llm_calls: Mutex::new(0),
         };
         let args = make_args();
-        let mut existing_labels = HashSet::new();
+
         let mut llm_pool: Option<ThreadPool> = None;
 
         let (state, metrics) = process_once_with_deps(
             &deps,
             &args,
             &mut cache,
-            &mut existing_labels,
             1,
             &mut llm_pool,
-            default_write_options(),
             &test_llm_config(),
+            None,
         )
         .expect("process_once should succeed");
 
@@ -785,25 +786,22 @@ mod tests {
                 summary: "llm_timeout".to_string(),
                 rule: RuleInput::default(),
             },
-            applied: Mutex::new(Vec::new()),
-            remove_inbox_flags: Mutex::new(Vec::new()),
             llm_calls: Mutex::new(0),
         };
         let args = make_args();
         let mut cache = CacheData::default();
         add_synced(&mut cache, "t-fail", "x@example.com", "unknown", "unknown");
-        let mut existing_labels = HashSet::new();
+
         let mut llm_pool: Option<ThreadPool> = None;
 
         let err = process_once_with_deps(
             &deps,
             &args,
             &mut cache,
-            &mut existing_labels,
             1,
             &mut llm_pool,
-            default_write_options(),
             &test_llm_config(),
+            None,
         )
         .unwrap_err();
 
@@ -828,8 +826,6 @@ mod tests {
                     exclude_keywords: vec![],
                 },
             },
-            applied: Mutex::new(Vec::new()),
-            remove_inbox_flags: Mutex::new(Vec::new()),
             llm_calls: Mutex::new(0),
         };
         let mut args = make_args();
@@ -861,33 +857,22 @@ mod tests {
             ..Default::default()
         });
 
-        let mut existing_labels = HashSet::new();
+
         let mut llm_pool: Option<ThreadPool> = None;
 
         let (state, metrics) = process_once_with_deps(
             &deps,
             &args,
             &mut cache,
-            &mut existing_labels,
             1,
             &mut llm_pool,
-            default_write_options(),
             &test_llm_config(),
+            None,
         )
         .expect("process_once should succeed");
 
         assert_eq!(state, "processed");
         assert_eq!(metrics.llm_success, 1);
-        assert!(existing_labels.contains("统一收纳"));
-        assert!(!existing_labels.contains("会议"));
-
-        let applied = deps.applied.lock().expect("lock poisoned");
-        assert_eq!(applied.len(), 1);
-        let grouped = &applied[0];
-        let ids = grouped
-            .get("统一收纳")
-            .expect("expected merged label to be applied");
-        assert_eq!(ids, &vec!["t-merge".to_string()]);
     }
 
 }

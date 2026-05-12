@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use crate::models::{CACHE_VERSION, CacheData, DEFAULT_FEEDBACK_MAX_APPLIED_IDS};
 use crate::utils::{log, normalize_label, now_ts};
 
+const MAX_BACKUPS: usize = 20;
+
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
@@ -82,6 +84,12 @@ pub(crate) fn save_cache(path: &str, cache: &CacheData) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create cache directory: {}", parent.display()))?;
     }
+
+    // Backup existing cache before overwriting
+    if p.exists() {
+        backup_cache(p)?;
+    }
+
     let body = serde_json::to_vec_pretty(cache)?;
     let tmp = temp_cache_path(p);
     {
@@ -99,6 +107,53 @@ pub(crate) fn save_cache(path: &str, cache: &CacheData) -> Result<()> {
             p.display()
         )
     })
+}
+
+/// Create a timestamped backup of the cache file and prune old backups.
+fn backup_cache(path: &Path) -> Result<()> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let backup_name = format!(
+        "{}.bak-{}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("cache.json"),
+        now
+    );
+    let backup_path = path.with_file_name(&backup_name);
+
+    fs::copy(path, &backup_path)
+        .with_context(|| format!("Failed to create cache backup: {}", backup_path.display()))?;
+
+    // Prune old backups (keep only MAX_BACKUPS most recent)
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let stem = path.file_name().and_then(|n| n.to_str()).unwrap_or("cache.json");
+    let mut backups: Vec<_> = fs::read_dir(parent)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .map(|n| n.starts_with(stem) && n.contains(".bak-"))
+                .unwrap_or(false)
+        })
+        .collect();
+    backups.sort_by_key(|e| e.file_name());
+    while backups.len() > MAX_BACKUPS {
+        if let Some(oldest) = backups.first() {
+            let p = oldest.path();
+            if fs::remove_file(&p).is_ok() {
+                log(&format!("CACHE_BACKUP_PRUNE: removed old backup {}", p.display()));
+            }
+        }
+        backups.remove(0);
+    }
+
+    Ok(())
 }
 
 pub(crate) fn cache_fingerprint(cache: &CacheData) -> Result<String> {

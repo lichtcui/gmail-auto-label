@@ -4,7 +4,6 @@ use std::fmt::{Display, Formatter};
 pub(crate) enum AppError {
     RateLimit(String),
     Config(String),
-    Command(String),
     Parse(String),
     Other(String),
 }
@@ -14,7 +13,6 @@ impl AppError {
         match self {
             AppError::RateLimit(_) => "rate_limit",
             AppError::Config(_) => "config_error",
-            AppError::Command(_) => "command_error",
             AppError::Parse(_) => "parse_error",
             AppError::Other(_) => "internal_error",
         }
@@ -26,7 +24,6 @@ impl Display for AppError {
         match self {
             AppError::RateLimit(msg)
             | AppError::Config(msg)
-            | AppError::Command(msg)
             | AppError::Parse(msg)
             | AppError::Other(msg) => write!(f, "{}", msg),
         }

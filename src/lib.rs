@@ -7,9 +7,7 @@
 mod app;
 mod cache;
 mod classify;
-mod command;
 mod errors;
-mod gog;
 mod llm;
 mod models;
 mod sync;

@@ -36,10 +36,20 @@ pub(crate) fn normalize_label(label: &str) -> String {
     let cleaned = label.split_whitespace().collect::<Vec<_>>().join(" ");
     let clipped: String = cleaned.chars().take(80).collect();
     if clipped.is_empty() {
-        "uncategorized".to_string()
-    } else {
-        clipped
+        return "uncategorized".to_string();
     }
+    // Normalize canonical category names (handle LLM case inconsistencies)
+    let lower = clipped.to_lowercase();
+    match lower.as_str() {
+        "ci/cd" => return "CI/CD".to_string(),
+        "security" => return "Security".to_string(),
+        "newsletter" => return "Newsletter".to_string(),
+        "recruitment" => return "Recruitment".to_string(),
+        "invoice" => return "Invoice".to_string(),
+        "others" => return "Others".to_string(),
+        _ => {}
+    }
+    clipped
 }
 
 pub(crate) fn resolve_label_alias(label: &str, cache: &CacheData) -> String {
